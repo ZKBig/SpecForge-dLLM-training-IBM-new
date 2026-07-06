@@ -683,4 +683,5 @@ if __name__ == "__main__":
         main()
     except Exception:
         import time  # hold the crashed process so the pod isn't deleted before we can exec in & inspect
+        print("*******SLEEPING********")
         time.sleep(10 ** 9)
