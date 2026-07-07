@@ -141,6 +141,12 @@ def parse_args():
         help="Fraction of total steps over which lambda_base decays linearly to 0 "
         "(1.0 = decay across the whole run, Domino default).",
     )
+
+    refiner_group.add_argument(
+        "--lambda-base-floor", type=float, default=0.0,
+        help="Final lambda_base after decay (default 0.0 = old behavior). Set >0 (e.g. 0.05-0.1) to "
+        "KEEP anchoring the drafter as a valid standalone drafter (good par-K seed) to the end.",
+    )
     # --- refiner architecture ablations (all optional, default == current) ---
     refiner_group.add_argument(
         "--mixer-type", type=str, default="attention", choices=["attention", "sgu"],
@@ -501,6 +507,7 @@ def main():
             f"  window_size  = {args.window_size}   num_refiner_layers = {args.num_refiner_layers}   "
             f"mlp_intermediate = {getattr(args, 'mlp_intermediate', None)}\n"
             f"  lambda_base  = {args.lambda_base_start}->0 (ratio {args.lambda_base_decay_ratio})   "
+            f"  lambda_base  = {args.lambda_base_start}->{args.lambda_base_floor} (ratio {args.lambda_base_decay_ratio})   "
             f"drafter_lr_scale = {args.drafter_lr_scale}\n"
             f"  head params  = {sum(p.numel() for p in refiner_model.refiner.parameters()):,} | "
             f"co-trained drafter params = {refiner_model._cotrain_drafter_params:,}\n"
@@ -624,7 +631,9 @@ def main():
 
             # base_loss curriculum: lambda_base decays start -> 0 over decay_ratio*total_steps
             decay_steps = max(1, int(total_steps * args.lambda_base_decay_ratio))
-            lambda_base = max(0.0, args.lambda_base_start * (1.0 - min(global_step / decay_steps, 1.0)))
+            # lambda_base = max(0.0, args.lambda_base_start * (1.0 - min(global_step / decay_steps, 1.0)))
+            _p = min(global_step / decay_steps, 1.0)   # 0 -> 1 over decay
+            lambda_base = args.lambda_base_start * (1.0 - _p) + args.lambda_base_floor * _p
 
             loss, accuracy = refiner_model(
                 input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask,
