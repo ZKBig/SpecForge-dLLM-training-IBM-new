@@ -25,8 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import DFlashDraftModel, load_and_process_dataset
 import distributed as dist
 
-# reuse the EXACT generation / loader logic from the (original) benchmark_refiner (no duplication)
-from benchmark_refiner import dflash_generate, load_refiner
+# reuse the LOW-RANK-aware generation / loader (readout = base + up(down(refined-h)) when a low-rank
+# head is present; load_refiner also loads the checkpoint's TRAINED lowrank_head). Same interface.
+from benchmark_lowrank_lmhead import dflash_generate, load_refiner
+from specforge.core.dflash_refiner import LowRankReadout
 
 
 def main() -> None:
@@ -49,6 +51,10 @@ def main() -> None:
     )
     parser.add_argument("--conf-threshold", type=float, default=0.9)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--lowrank-rank", type=int, default=0,
+                        help="0 = full lm_head (baseline accept). >0 = low-rank readout: uses the "
+                        "checkpoint's TRAINED lowrank_head if present (its rank; the flag only enables "
+                        "it), else attaches a post-hoc SVD head at this rank from lm_head.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -91,7 +97,28 @@ def main() -> None:
     del ck
 
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
-    refiner = load_refiner(args.refiner_path, draft_model, device)  # reads refiner_state_dict
+    refiner = load_refiner(args.refiner_path, draft_model, device)  # reads refiner_state_dict (+ lowrank_head if present)
+
+    # --lowrank-rank: master ON/OFF for the low-rank readout (same logic as benchmark_lowrank_lmhead).
+    #   0  -> FULL lm_head (disable any head, incl. one loaded from the checkpoint) = baseline accept
+    #   >0 -> low-rank: TRAINED head if the ckpt has one; else POST-HOC SVD head at this rank.
+    if args.lowrank_rank <= 0:
+        if getattr(refiner, "lowrank_head", None) is not None:
+            refiner.lowrank_head = None
+            if dist.is_main():
+                print("[lowrank] --lowrank-rank 0 -> FULL lm_head (checkpoint's low-rank head disabled)")
+    elif getattr(refiner, "lowrank_head", None) is None:
+        H = draft_model.config.hidden_size
+        V = target.lm_head.weight.shape[0]
+        head = LowRankReadout(H, int(V), int(args.lowrank_rank))
+        head.svd_init_from(target.lm_head.weight)
+        refiner.lowrank_head = head.to(device).to(torch.bfloat16)
+        if dist.is_main():
+            print(f"[lowrank] POST-HOC SVD low-rank readout (rank {args.lowrank_rank}) from lm_head "
+                  f"(untrained -> expect some accept drop)")
+    elif dist.is_main():
+        r = refiner.lowrank_head.up.weight.shape[1]
+        print(f"[lowrank] using TRAINED low-rank head from checkpoint (rank {r}; flag only enables it)")
 
     if args.compile:
         target = torch.compile(target)
