@@ -28,6 +28,10 @@ class DFlashTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    # POST-NORM last-layer hidden (dim H): lm_head(final_hidden) == target next-token logits.
+    # `hidden_states` above is the drafter's CAPTURED MIDDLE layers (multi-layer, NOT lm_head-able);
+    # final_hidden is what the L1/TV loss needs for the teacher distribution. None if backend omits it.
+    final_hidden: torch.Tensor = None
 
 
 class DFlashTargetModel(ABC):
@@ -284,6 +288,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            final_hidden=outputs.hidden_states[-1],  # post-norm final hidden -> target logits (L1/TV)
         )
 
 
