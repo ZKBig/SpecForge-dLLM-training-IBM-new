@@ -75,7 +75,12 @@ def parse_args():
         type=str,
         required=True,
         help="Path/HF-repo of the DFlash drafter to INITIALIZE from (then co-trained), "
-        "e.g. z-lab/Qwen3-8B-DFlash-b16",
+        "e.g. z-lab/Qwen3-8B-DFlash-b16. With --random-init-drafter only its CONFIG (arch) is used.",
+    )
+    model_group.add_argument(
+        "--random-init-drafter", action="store_true",
+        help="Setting 2 (DSpark-style): build the drafter RANDOMLY from --dflash-model-path's config "
+        "(no checkpoint) and train from scratch. Needs lots of data (full Open-PerfectBlend).",
     )
     model_group.add_argument(
         "--attention-backend",
@@ -466,11 +471,19 @@ def main():
 
     # --- DFlash drafter (initialized from checkpoint, then CO-TRAINED) ---
     print_on_rank0(f"Loading DFlash drafter (to co-train) from {args.dflash_model_path}")
-    draft_model = (
-        DFlashDraftModel.from_pretrained(args.dflash_model_path, torch_dtype=torch.bfloat16)
-        .cuda()
-        .to(torch.bfloat16)
-    )
+    if args.random_init_drafter:
+        # Setting 2 (DSpark-style): build the drafter from config with RANDOM init (NO checkpoint).
+        # Only the architecture (layers / target_layer_ids / block_size / mask_token) comes from the
+        # --dflash-model-path config; weights are fresh -> drafter trained from scratch with the head.
+        _dcfg = DFlashDraftModel.config_class.from_pretrained(args.dflash_model_path)
+        draft_model = DFlashDraftModel(_dcfg).cuda().to(torch.bfloat16)
+        print_on_rank0(f"[random-init-drafter] RANDOM weights; arch-only from {args.dflash_model_path}")
+    else:
+        draft_model = (
+            DFlashDraftModel.from_pretrained(args.dflash_model_path, torch_dtype=torch.bfloat16)
+            .cuda()
+            .to(torch.bfloat16)
+        )
     draft_model.config._attn_implementation = args.attention_backend
     block_size = draft_model.block_size
     mask_token_id = (draft_model.config.dflash_config or {}).get("mask_token_id", None)
