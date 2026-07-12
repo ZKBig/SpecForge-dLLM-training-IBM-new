@@ -115,6 +115,12 @@ def parse_args():
     refiner_group.add_argument("--input-mode", type=str, default="concat", choices=["concat", "add"],
                                help="'concat' in_proj[down_h;down_g;W1] vs 'add' down_hg[h;g]+W1.")
     refiner_group.add_argument("--mixer-init", type=str, default="eye", choices=["eye", "zeros", "random"])
+    refiner_group.add_argument("--no-sublayer-norm", action="store_true",
+                               help="Drop input_norm/post_norm/out_norm (the 3 RMSNorms). 1-layer + ReZero "
+                               "block likely needs no pre-norm; also removes the norm that blocks fold(I).")
+    refiner_group.add_argument("--no-mix-out", action="store_true",
+                               help="Drop the post-mixer Linear -> mixer sublayer becomes x + mix(x). "
+                               "With --no-sublayer-norm this makes the mixer exactly x + L*x (foldable).")
     refiner_group.add_argument("--l1-alpha", type=float, default=0.9, help="DSpark L1/TV weight.")
     refiner_group.add_argument("--ce-alpha", type=float, default=0.1, help="DSpark CE weight.")
     refiner_group.add_argument("--no-cotrain-drafter", action="store_true",
@@ -551,6 +557,8 @@ def main():
         mlp_ratio=args.mlp_ratio,
         input_mode=args.input_mode,
         mixer_init=args.mixer_init,
+        use_norm=not args.no_sublayer_norm,
+        use_mix_out=not args.no_mix_out,
         l1_alpha=args.l1_alpha,
         ce_alpha=args.ce_alpha,
         loss_decay_gamma=args.loss_decay_gamma,
