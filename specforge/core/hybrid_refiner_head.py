@@ -93,6 +93,7 @@ class HybridRefinerHead(nn.Module):
                  sgu_enabled: bool = True, use_hidden: bool = True, use_residual: bool = True,
                  use_mixer: bool = True, use_mlp: bool = True, mlp_ratio: int = 4,
                  input_mode: str = "concat", mixer_init: str = "eye",
+                 use_norm: bool = True, use_mix_out: bool = True,
                  initializer_range: float = 0.02):
         super().__init__()
         r = markov_rank
@@ -110,6 +111,14 @@ class HybridRefinerHead(nn.Module):
         # Ablate independently: MLP-only head = use_mixer=False; mixer-only = use_mlp=False.
         self.use_mixer = bool(use_mixer)
         self.use_mlp = bool(use_mlp)
+        # Sublayer machinery knobs (item ④ / norm ablation):
+        #   use_norm=False    -> drop input_norm/post_norm/out_norm (the 3 RMSNorms). 1-layer + ReZero
+        #                        block probably doesn't need pre-norm; also removes the norm that breaks fold.
+        #   use_mix_out=False -> drop the post-mixer Linear, so the mixer sublayer becomes x + mix(x).
+        #   use_norm=False AND use_mix_out=False  ==>  mixer = x + L*x  (pure linear token-mix;
+        #                        foldable at inference as (I+L)*x -> zeros/random-init ≡ identity-init).
+        self.use_norm = bool(use_norm)
+        self.use_mix_out = bool(use_mix_out)
         # input_mode: how h/g enter the r-dim refiner.
         #   'concat' -> in_proj( [down_h(h); down_g(g); W1[prev]] )              (3r -> r)
         #   'add'    -> down_hg( [h;g] ) + W1[prev]   (single 2H->r down, token added residual-style)
@@ -133,14 +142,18 @@ class HybridRefinerHead(nn.Module):
             else:  # token-only
                 self.in_proj = nn.Linear(r, r, bias=False)
             if self.use_mixer:
-                self.input_norm = RMSNorm(r)
+                if self.use_norm:
+                    self.input_norm = RMSNorm(r)
                 self.mix = ChannelWiseCausalMix(r, block_size, init=self.mixer_init,
                                                 initializer_range=initializer_range)
-                self.mix_out = nn.Linear(r, r, bias=False)
+                if self.use_mix_out:
+                    self.mix_out = nn.Linear(r, r, bias=False)
             if self.use_mlp:
-                self.post_norm = RMSNorm(r)
+                if self.use_norm:
+                    self.post_norm = RMSNorm(r)
                 self.mlp = RDimMLP(r, r * mlp_ratio)
-            self.out_norm = RMSNorm(r)
+            if self.use_norm:
+                self.out_norm = RMSNorm(r)
             if self.use_residual:
                 self.res_gate = nn.Parameter(torch.zeros(1))  # ReZero: starts as pure Markov
 
@@ -163,9 +176,9 @@ class HybridRefinerHead(nn.Module):
                 nn.init.normal_(self.in_proj.weight, mean=0.0, std=std)
             else:  # token-only
                 nn.init.normal_(self.in_proj.weight, mean=0.0, std=std)
-            if self.use_mixer:
+            if self.use_mixer and self.use_mix_out:
                 nn.init.normal_(self.mix_out.weight, mean=0.0, std=std)
-                # mixer L stays eye-init (identity token-mix); norms stay ones; res_gate stays zero.
+                # mixer L stays init'd per mixer_init; norms (if any) stay ones; res_gate stays zero.
             if self.use_mlp:
                 nn.init.normal_(self.mlp.gate_proj.weight, mean=0.0, std=std)
                 nn.init.normal_(self.mlp.up_proj.weight, mean=0.0, std=std)
@@ -180,10 +193,15 @@ class HybridRefinerHead(nn.Module):
         else:  # token-only
             x = self.in_proj(markov_latent)
         if self.use_mixer:
-            x = x + self.mix_out(self.mix(self.input_norm(x)))  # mixer sublayer (cross-position)
+            m = self.input_norm(x) if self.use_norm else x
+            m = self.mix(m)
+            if self.use_mix_out:
+                m = self.mix_out(m)
+            x = x + m                                           # no-norm + no-mix_out => x + L*x (foldable)
         if self.use_mlp:
-            x = x + self.mlp(self.post_norm(x))                 # MLP sublayer (per-position)
-        return self.out_norm(x)
+            p = self.post_norm(x) if self.use_norm else x
+            x = x + self.mlp(p)                                 # MLP sublayer (per-position)
+        return self.out_norm(x) if self.use_norm else x
 
     def compute_latent(self, h, g, prev_token_ids):
         """The r-dim latent whose W2-projection is the bias. Markov = latent = W1[prev]."""

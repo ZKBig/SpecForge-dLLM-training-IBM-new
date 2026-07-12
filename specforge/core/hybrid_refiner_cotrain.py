@@ -32,6 +32,7 @@ class OnlineHybridRefinerCoTrain(nn.Module):
                  markov_rank: int = 256, sgu_enabled: bool = True, use_hidden: bool = True,
                  use_residual: bool = True, use_mixer: bool = True, use_mlp: bool = True,
                  mlp_ratio: int = 4, input_mode: str = "concat", mixer_init: str = "eye",
+                 use_norm: bool = True, use_mix_out: bool = True,
                  l1_alpha: float = 0.9, ce_alpha: float = 0.1, loss_decay_gamma: float = 4.0,
                  consistency_weight: float = 0.0, cotrain_drafter: bool = True):
         super().__init__()
@@ -42,6 +43,7 @@ class OnlineHybridRefinerCoTrain(nn.Module):
             V, H, self.block_size, markov_rank=markov_rank, sgu_enabled=sgu_enabled,
             use_hidden=use_hidden, use_residual=use_residual, use_mixer=use_mixer,
             use_mlp=use_mlp, mlp_ratio=mlp_ratio, input_mode=input_mode, mixer_init=mixer_init,
+            use_norm=use_norm, use_mix_out=use_mix_out,
         )
         self.l1_alpha = float(l1_alpha)
         self.ce_alpha = float(ce_alpha)
