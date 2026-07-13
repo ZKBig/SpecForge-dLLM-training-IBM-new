@@ -17,6 +17,7 @@ NOT modified: dflash_refiner.py / dflash_refiner_cotrain.py. Pass a `CoTrainFeat
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from specforge.core.hybrid_refiner_head import (
     HybridRefinerHead,
@@ -124,14 +125,18 @@ class OnlineHybridRefinerCoTrain(nn.Module):
             l1_alpha=self.l1_alpha, ce_alpha=self.ce_alpha, loss_decay_gamma=None,
         )
 
-        # optional drafter anchor: keep base (gate=0 drafter readout) a valid standalone drafter.
+        # Drafter-anchor: ADDITIVE pure-CE(base) with weight lambda_base -> keep the drafter a valid
+        # standalone drafter. CE (NOT L1): the accept-length metric scores base.argmax == ground-truth,
+        # which CE directly optimizes; L1 matches the target's SOFT distribution (its uncertainty) ->
+        # misaligned with argmax-accept -> drags a pretrained drafter down. refined_loss keeps full
+        # weight (CE+L1 trains the refiner). Total = CE(refined)+L1(refined) + lambda_base*CE(base).
+        # CE-only also skips the full-vocab softmax on base -> less memory than the old base_loss.
         if lambda_base > 0.0:
             V = base_logits.shape[-1]
-            base_loss, _, _ = markov_style_loss(
-                base_logits.reshape(-1, V), target_logits.reshape(-1, V), tgt.reshape(-1),
-                w.reshape(-1), self.l1_alpha, self.ce_alpha,
-            )
-            loss = (1.0 - lambda_base) * loss + lambda_base * base_loss
+            wf = w.reshape(-1)
+            ce_base = (F.cross_entropy(base_logits.reshape(-1, V), tgt.reshape(-1), reduction="none")
+                       * wf).sum() / wf.sum().clamp(min=1.0)
+            loss = loss + lambda_base * ce_base
 
         with torch.no_grad():
             pred = terms["refined"].reshape(-1, base_logits.shape[-1]).argmax(dim=-1)
