@@ -31,20 +31,41 @@ class OnlineHybridRefinerCoTrain(nn.Module):
 
     def __init__(self, feature_extractor, *,
                  markov_rank: int = 256, sgu_enabled: bool = True, use_hidden: bool = True,
+                 use_perpos: bool = True, use_global: bool = True,
                  use_residual: bool = True, use_mixer: bool = True, use_mlp: bool = True,
                  mlp_ratio: int = 4, input_mode: str = "concat", mixer_init: str = "eye",
-                 use_norm: bool = True, use_mix_out: bool = True,
+                 use_norm: bool = True, use_mix_out: bool = True, shared_readout_rank: int = 0,
+                 base_readout_rank: int = 0,
                  l1_alpha: float = 0.9, ce_alpha: float = 0.1, loss_decay_gamma: float = 4.0,
                  consistency_weight: float = 0.0, cotrain_drafter: bool = True):
         super().__init__()
         self.feature_extractor = feature_extractor
         self.block_size = feature_extractor.block_size
         V, H = feature_extractor.lm_head.weight.shape  # lm_head: Linear(H, V) -> weight (V, H)
+        # SHARED low-rank lm_head: if shared_readout_rank>0 the head uses ONE low-rank readout (w2 + ro_down)
+        # for BOTH the drafter base AND the refined output: base = w2(ro_down(h)), refined = w2(ro_down(h)+code).
+        # The code dim (markov_rank) is forced to the shared rank. TEACHER target_logits ALWAYS stays full
+        # lm_head. Calibration-fit via init_shared_readout(). 0 -> full frozen lm_head base (no compression).
+        # SEPARATE low-rank base (non-shared): base_readout_rank>0 gives the drafter base its OWN low-rank
+        # readout at that (larger) rank while the refiner keeps markov_rank -> base accept + refiner latency
+        # decoupled. Mutually exclusive with shared_readout_rank. EITHER -> head computes base internally.
+        self.shared_readout_rank = int(shared_readout_rank)
+        self.base_readout_rank = int(base_readout_rank)
+        # rank >= hidden: no compression possible -> fall back to the FULL frozen lm_head base (no readout,
+        # no training). Makes base_readout_rank=H the exact full-rank control. (head normalizes the same way.)
+        if self.base_readout_rank >= H:
+            self.base_readout_rank = 0
+        assert not (self.shared_readout_rank > 0 and self.base_readout_rank > 0), \
+            "shared_readout_rank (shared) and base_readout_rank (separate) are mutually exclusive"
+        self.use_lowrank_base = self.shared_readout_rank > 0 or self.base_readout_rank > 0
+        head_rank = self.shared_readout_rank if self.shared_readout_rank > 0 else markov_rank
         self.refiner = HybridRefinerHead(
-            V, H, self.block_size, markov_rank=markov_rank, sgu_enabled=sgu_enabled,
-            use_hidden=use_hidden, use_residual=use_residual, use_mixer=use_mixer,
+            V, H, self.block_size, markov_rank=head_rank, sgu_enabled=sgu_enabled,
+            use_hidden=use_hidden, use_perpos=use_perpos, use_global=use_global,
+            use_residual=use_residual, use_mixer=use_mixer,
             use_mlp=use_mlp, mlp_ratio=mlp_ratio, input_mode=input_mode, mixer_init=mixer_init,
             use_norm=use_norm, use_mix_out=use_mix_out,
+            shared_readout=self.shared_readout_rank > 0, base_readout_rank=self.base_readout_rank,
         )
         self.l1_alpha = float(l1_alpha)
         self.ce_alpha = float(ce_alpha)
@@ -59,6 +80,25 @@ class OnlineHybridRefinerCoTrain(nn.Module):
             for p in self.feature_extractor.draft_model.parameters():
                 p.requires_grad = True
                 self._cotrain_drafter_params += p.numel()
+
+    @torch.no_grad()
+    def init_shared_readout(self, covariance, rotate=False):
+        """Calibration (data-PCA) init of the head's SHARED low-rank readout (w2 + ro_down) from
+        C = sum_i h_i h_i^T. After: base = w2(ro_down(h)) ~= lm_head(h); trainable (co-adapts)."""
+        assert self.shared_readout_rank > 0, "init_shared_readout requires shared_readout_rank > 0"
+        self.refiner.fit_shared_readout(covariance, self.feature_extractor.lm_head.weight, rotate=rotate)
+
+    @torch.no_grad()
+    def init_base_readout(self, covariance, rotate=False):
+        """Calibration (data-PCA) init of the head's SEPARATE low-rank base readout (base_down + base_up)
+        from C = sum_i h_i h_i^T. After: base = base_up(base_down(h)) ~= lm_head(h); trainable (co-adapts)."""
+        assert self.base_readout_rank > 0, "init_base_readout requires base_readout_rank > 0"
+        self.refiner.fit_base_readout(covariance, self.feature_extractor.lm_head.weight, rotate=rotate)
+
+    def _base_logits(self, h):
+        """Non-shared drafter readout = full frozen target lm_head. (Shared mode computes base inside the
+        head's forward, so this is only used by the non-shared path / accept eval.)"""
+        return self.feature_extractor.lm_head(h)
 
     def _decay_weight(self, valid):
         """Per-position loss weight = binary_mask * exp(-(k-1)_+/gamma). The (k-1) shift accounts
@@ -97,7 +137,8 @@ class OnlineHybridRefinerCoTrain(nn.Module):
         am1_idx = (f.anchor_positions - 1).clamp(min=0)
         prev_tok[:, 0] = torch.gather(input_ids, 1, am1_idx).reshape(BN)  # token before block
 
-        base_logits = fe.lm_head(h)                            # drafter parallel logits, full V (== DSpark base)
+        # SHARED: base is computed INSIDE the head's forward (via w2(ro_down(h))); pass None. Else: full lm_head.
+        base_in = None if self.use_lowrank_base else self._base_logits(h)
 
         # Full-vocab teacher distribution: target lm_head( target POST-NORM hidden that predicts each
         # block token ). target_ids[k] is at seq position anchor+k -> predicting hidden is at anchor+k-1.
@@ -120,23 +161,22 @@ class OnlineHybridRefinerCoTrain(nn.Module):
         w = self._decay_weight(valid)                          # decay folded in -> pass gamma=None below
 
         loss, terms = combined_training_loss(
-            self.refiner, base_logits, h, g, prev_tok, target_logits, tgt, w,
+            self.refiner, base_in, h, g, prev_tok, target_logits, tgt, w,
             consistency_weight=self.consistency_weight,
             l1_alpha=self.l1_alpha, ce_alpha=self.ce_alpha, loss_decay_gamma=None,
         )
+        base_logits = terms["base"]   # real base: shared -> w2(ro_down(h)); else -> echoed lm_head(h)
 
-        # Drafter-anchor: ADDITIVE pure-CE(base) with weight lambda_base -> keep the drafter a valid
-        # standalone drafter. CE (NOT L1): the accept-length metric scores base.argmax == ground-truth,
-        # which CE directly optimizes; L1 matches the target's SOFT distribution (its uncertainty) ->
-        # misaligned with argmax-accept -> drags a pretrained drafter down. refined_loss keeps full
-        # weight (CE+L1 trains the refiner). Total = CE(refined)+L1(refined) + lambda_base*CE(base).
-        # CE-only also skips the full-vocab softmax on base -> less memory than the old base_loss.
+        # Drafter-anchor: ADDITIVE markov_style_loss(base) = ce_alpha*CE + l1_alpha*L1 (== CE + TV, the
+        # SAME DSpark loss the refiner gets), weighted by lambda_base -> keeps the co-trained drafter a
+        # valid standalone drafter matching the target's FULL distribution (not just argmax).
+        # Total = markov_style_loss(refined) + lambda_base * markov_style_loss(base).
         if lambda_base > 0.0:
             V = base_logits.shape[-1]
-            wf = w.reshape(-1)
-            ce_base = (F.cross_entropy(base_logits.reshape(-1, V), tgt.reshape(-1), reduction="none")
-                       * wf).sum() / wf.sum().clamp(min=1.0)
-            loss = loss + lambda_base * ce_base
+            base_loss, _, _ = markov_style_loss(
+                base_logits.reshape(-1, V), target_logits.reshape(-1, V), tgt.reshape(-1),
+                w.reshape(-1), self.l1_alpha, self.ce_alpha)
+            loss = loss + lambda_base * base_loss
 
         with torch.no_grad():
             pred = terms["refined"].reshape(-1, base_logits.shape[-1]).argmax(dim=-1)
@@ -164,7 +204,10 @@ class OnlineHybridRefinerCoTrain(nn.Module):
         h = f.output_hidden.view(B, n, block, H).reshape(BN, block, H)
         g = h.mean(dim=1, keepdim=True).expand(-1, block, -1)
         tgt = f.target_ids.reshape(BN, block)                  # [:,0] = real anchor
-        base_logits = fe.lm_head(h)                            # [BN, block, V]
+        # SHARED: base via the head's shared readout w2(ro_down(h)); else full lm_head. (eval, no_grad ->
+        # calling the head method under SHARD_GRAD_OP full params is fine.)
+        base_logits = (self.refiner.readout_base(h) if self.use_lowrank_base
+                       else self._base_logits(h))               # [BN, block, V]
 
         anchors = f.anchor_positions.reshape(BN, 1)
         pos_abs = anchors + torch.arange(block, device=device).view(1, block)
@@ -189,7 +232,7 @@ class OnlineHybridRefinerCoTrain(nn.Module):
             for _ in range(K):
                 prev_tok = pred.roll(shifts=1, dims=1)
                 prev_tok[:, 0] = tok_am1
-                new_pred = self.refiner(base_logits, h, g, prev_tok).argmax(dim=-1)
+                new_pred = self.refiner(base_logits, h, g, prev_tok)[1].argmax(dim=-1)   # [1] = refined
                 new_pred[:, 0] = tgt[:, 0]
                 pred = new_pred
         else:
@@ -199,5 +242,5 @@ class OnlineHybridRefinerCoTrain(nn.Module):
             for k in range(1, block):
                 prev_tok = pred.roll(shifts=1, dims=1)
                 prev_tok[:, 0] = tok_am1
-                pred[:, k] = self.refiner(base_logits, h, g, prev_tok)[:, k, :].argmax(dim=-1)
+                pred[:, k] = self.refiner(base_logits, h, g, prev_tok)[1][:, k, :].argmax(dim=-1)   # [1]=refined
         return _accept(pred), drafter_accept

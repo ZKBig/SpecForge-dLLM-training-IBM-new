@@ -90,10 +90,12 @@ class HybridRefinerHead(nn.Module):
     """See module docstring. Produces refined_logits = base_logits + bias."""
 
     def __init__(self, vocab_size: int, hidden_size: int, block_size: int, markov_rank: int = 256,
-                 sgu_enabled: bool = True, use_hidden: bool = True, use_residual: bool = True,
+                 sgu_enabled: bool = True, use_hidden: bool = True,
+                 use_perpos: bool = True, use_global: bool = True, use_residual: bool = True,
                  use_mixer: bool = True, use_mlp: bool = True, mlp_ratio: int = 4,
                  input_mode: str = "concat", mixer_init: str = "eye",
                  use_norm: bool = True, use_mix_out: bool = True,
+                 shared_readout: bool = False, base_readout_rank: int = 0,
                  initializer_range: float = 0.02):
         super().__init__()
         r = markov_rank
@@ -105,7 +107,14 @@ class HybridRefinerHead(nn.Module):
         # SCHEDULING; we deliberately OMIT it from BOTH heads. It's orthogonal to the fixed-block
         # accept-rate comparison, and excluding it identically keeps the head-vs-head test clean.
         self.sgu_enabled = bool(sgu_enabled)
-        self.use_hidden = bool(use_hidden)
+        # Hidden sources split into two ABLATABLE flags: use_perpos (per-position drafter hidden h) and
+        # use_global (block-summary g = mean_pos(h)). use_hidden=False forces token-only (both off) for
+        # backward compat; otherwise each is independent -> heads: both (default), perpos-only, global-only.
+        if not bool(use_hidden):
+            use_perpos = use_global = False
+        self.use_perpos = bool(use_perpos)
+        self.use_global = bool(use_global)
+        self.use_hidden = self.use_perpos or self.use_global   # any hidden source active
         self.use_residual = bool(use_residual)
         # mixer = cross-position channel mix (long-range); mlp = per-position nonlinearity.
         # Ablate independently: MLP-only head = use_mixer=False; mixer-only = use_mlp=False.
@@ -132,13 +141,42 @@ class HybridRefinerHead(nn.Module):
         self.w1 = nn.Embedding(vocab_size, r)          # prev token -> r  (down / Markov embedding)
         self.w2 = nn.Linear(r, vocab_size, bias=False)  # r -> V           (up / readout)
 
+        # SHARED low-rank readout: reuse w2 (r->V) as the SINGLE shared 'up' for BOTH base and refined.
+        # ro_down (H->r) reads the drafter hidden h so base = w2(ro_down(h)) and refined = base + w2(code)
+        # = w2(ro_down(h)+code). r == the shared rank. Calibration-fit via fit_shared_readout().
+        self.shared_readout = bool(shared_readout)
+        if self.shared_readout:
+            self.ro_down = nn.Linear(hidden_size, r, bias=False)
+
+        # SEPARATE low-rank base readout (non-shared): the drafter base gets its OWN low-rank readout at
+        # base_readout_rank (e.g. 512/1024) DECOUPLED from the refiner's markov_rank w2. Lets the base keep
+        # a HIGH rank (for accept) while the refiner stays small (for latency). base = base_up(base_down(h)),
+        # calibration-fit via fit_base_readout(). Mutually exclusive with shared_readout.
+        self.base_readout_rank = int(base_readout_rank)
+        # rank >= hidden_size: a full-rank readout has NO compression (up(down(h)) can equal lm_head(h)
+        # EXACTLY), so there's zero latency point AND no reason to train a 638M readout -> fall back to the
+        # full FROZEN lm_head base (no module, no training). Makes --lowrank-base-rank 4096 the exact
+        # full-rank control (base = frozen lm_head, identical to non-low-rank mode).
+        if self.base_readout_rank >= hidden_size:
+            self.base_readout_rank = 0
+        assert not (self.shared_readout and self.base_readout_rank > 0), \
+            "shared_readout and base_readout_rank are mutually exclusive"
+        if self.base_readout_rank > 0:
+            self.base_down = nn.Linear(hidden_size, self.base_readout_rank, bias=False)
+            self.base_up = nn.Linear(self.base_readout_rank, vocab_size, bias=False)
+
         if self.sgu_enabled:
-            if self.use_hidden and self.input_mode == "add":
-                self.down_hg = nn.Linear(2 * hidden_size, r, bias=False)  # [h;g] -> r; token added
-            elif self.use_hidden:  # concat
-                self.down_h = nn.Linear(hidden_size, r, bias=False)  # h -> r
-                self.down_g = nn.Linear(hidden_size, r, bias=False)  # g (block summary) -> r
-                self.in_proj = nn.Linear(3 * r, r, bias=False)
+            n_hid = int(self.use_perpos) + int(self.use_global)   # 0 / 1 / 2 active hidden sources
+            if n_hid == 2 and self.input_mode == "add":
+                self.down_hg = nn.Linear(2 * hidden_size, r, bias=False)  # both + add: fused [h;g] -> r (unchanged)
+            elif self.use_hidden:  # concat (any n_hid), OR add with a single hidden source
+                if self.use_perpos:
+                    self.down_h = nn.Linear(hidden_size, r, bias=False)  # h -> r
+                if self.use_global:
+                    self.down_g = nn.Linear(hidden_size, r, bias=False)  # g (block summary) -> r
+                if self.input_mode == "concat":
+                    self.in_proj = nn.Linear((1 + n_hid) * r, r, bias=False)  # markov + n_hid hidden -> r
+                # add + single source: no in_proj (x = down_x(x) + markov_latent)
             else:  # token-only
                 self.in_proj = nn.Linear(r, r, bias=False)
             if self.use_mixer:
@@ -165,17 +203,22 @@ class HybridRefinerHead(nn.Module):
         two small matrices), i.e. the head starts as 'no correction'. PyTorch defaults (Embedding
         std=1, Linear kaiming) would give a huge initial bias -- do NOT rely on them."""
         std = self.initializer_range
-        nn.init.normal_(self.w1.weight, mean=0.0, std=std)   # markov_w1  (== DeepSpec)
-        nn.init.normal_(self.w2.weight, mean=0.0, std=std)   # markov_w2  (== DeepSpec)
+        # SHARED mode: w2 (the shared 'up') is calibration-fit later (large ~lm_head scale), so the code
+        # W1[prev] MUST start at ZERO -> code=0 at init -> refined = base (else up(W1[prev]) blows up).
+        if self.shared_readout:
+            nn.init.zeros_(self.w1.weight)                   # code starts 0 -> refined == base at init
+            nn.init.normal_(self.ro_down.weight, mean=0.0, std=std)   # overwritten by fit_shared_readout
+        else:
+            nn.init.normal_(self.w1.weight, mean=0.0, std=std)   # markov_w1  (== DeepSpec)
+        nn.init.normal_(self.w2.weight, mean=0.0, std=std)   # markov_w2 (== DeepSpec; overwritten by fit if shared)
+        if self.base_readout_rank > 0:
+            nn.init.normal_(self.base_down.weight, mean=0.0, std=std)  # both overwritten by fit_base_readout;
+            nn.init.zeros_(self.base_up.weight)                        # zeros -> base=0 until calibration-fit
         if self.sgu_enabled:
-            if self.use_hidden and self.input_mode == "add":
-                nn.init.normal_(self.down_hg.weight, mean=0.0, std=std)
-            elif self.use_hidden:  # concat
-                nn.init.normal_(self.down_h.weight, mean=0.0, std=std)
-                nn.init.normal_(self.down_g.weight, mean=0.0, std=std)
-                nn.init.normal_(self.in_proj.weight, mean=0.0, std=std)
-            else:  # token-only
-                nn.init.normal_(self.in_proj.weight, mean=0.0, std=std)
+            for _name in ("down_hg", "down_h", "down_g", "in_proj"):   # whichever input projections exist
+                _mod = getattr(self, _name, None)
+                if _mod is not None:
+                    nn.init.normal_(_mod.weight, mean=0.0, std=std)
             if self.use_mixer and self.use_mix_out:
                 nn.init.normal_(self.mix_out.weight, mean=0.0, std=std)
                 # mixer L stays init'd per mixer_init; norms (if any) stay ones; res_gate stays zero.
@@ -187,9 +230,19 @@ class HybridRefinerHead(nn.Module):
     def _refine(self, markov_latent, h, g):
         """r-dim SGU refinement over the block. markov_latent/h/g are per-(BN,block)."""
         if self.use_hidden and self.input_mode == "add":
-            x = self.down_hg(torch.cat([h, g], dim=-1)) + markov_latent  # add token residual-style
-        elif self.use_hidden:  # concat
-            x = self.in_proj(torch.cat([self.down_h(h), self.down_g(g), markov_latent], dim=-1))
+            if hasattr(self, "down_hg"):                        # both sources -> fused [h;g]
+                hid = self.down_hg(torch.cat([h, g], dim=-1))
+            else:                                               # single source (perpos-only or global-only)
+                hid = self.down_h(h) if self.use_perpos else self.down_g(g)
+            x = hid + markov_latent                             # add token residual-style
+        elif self.use_hidden:  # concat: active hidden projections + markov_latent -> in_proj
+            parts = []
+            if self.use_perpos:
+                parts.append(self.down_h(h))
+            if self.use_global:
+                parts.append(self.down_g(g))
+            parts.append(markov_latent)
+            x = self.in_proj(torch.cat(parts, dim=-1))
         else:  # token-only
             x = self.in_proj(markov_latent)
         if self.use_mixer:
@@ -216,9 +269,54 @@ class HybridRefinerHead(nn.Module):
     def bias(self, h, g, prev_token_ids):
         return self.w2(self.compute_latent(h, g, prev_token_ids))  # (BN, block, V)
 
+    def readout_base(self, h):
+        """Low-rank drafter base logits from hidden h. SHARED: w2(ro_down(h)) (reuses the refiner's up).
+        SEPARATE: base_up(base_down(h)) (own readout at base_readout_rank, decoupled from the refiner)."""
+        if self.shared_readout:
+            return self.w2(self.ro_down(h))
+        return self.base_up(self.base_down(h))
+
     def forward(self, base_logits, h, g, prev_token_ids):
-        """base_logits=(BN,block,V)=lm_head(h). h,g=(BN,block,H). prev_token_ids=(BN,block)."""
-        return base_logits + self.bias(h, g, prev_token_ids)
+        """Returns (base_logits, refined_logits).
+        SHARED: base is computed INTERNALLY via the shared readout (the base_logits arg is ignored) so both
+        base and refined go through the SAME w2 -> refined = w2(ro_down(h)+code). Else: base_logits is the
+        full frozen lm_head(h) passed in. Computing base inside forward keeps its grad under FSDP."""
+        base = self.readout_base(h) if (self.shared_readout or self.base_readout_rank > 0) else base_logits
+        return base, base + self.bias(h, g, prev_token_ids)
+
+    @torch.no_grad()
+    def fit_shared_readout(self, cov, lm_head_weight, rotate=False):
+        """Calibration / data-PCA init of the SHARED readout: ro_down = P^T, w2 = W @ P, where P = top-r
+        eigenvectors of the activation covariance C = sum h h^T. Then base = w2(ro_down(h)) = W(P P^T)h ~=
+        lm_head(h) (h lives in span(P)). Same fold as LowRankReadout.fit_from_covariance, applied to (ro_down, w2)."""
+        assert self.shared_readout, "fit_shared_readout requires shared_readout=True"
+        r = self.markov_rank
+        dev = lm_head_weight.device
+        evals, evecs = torch.linalg.eigh(cov.float().to(dev))          # ascending, symmetric PSD
+        P = evecs[:, -r:]                                              # top-r principal directions (H, r)
+        if rotate:
+            Q, _ = torch.linalg.qr(torch.randn(r, r, device=dev, dtype=P.dtype))
+            P = P @ Q
+        up = lm_head_weight.detach().float() @ P                       # (V, r) = W P
+        self.ro_down.weight.copy_(P.t().to(self.ro_down.weight))       # (r, H) = P^T
+        self.w2.weight.copy_(up.to(self.w2.weight))                    # (V, r) = shared up
+
+    @torch.no_grad()
+    def fit_base_readout(self, cov, lm_head_weight, rotate=False):
+        """Calibration / data-PCA init of the SEPARATE base readout (non-shared): base_down = P^T,
+        base_up = W @ P with P = top-(base_readout_rank) eigvecs of C. => base_up(base_down(h)) ~= lm_head(h).
+        Same fit as fit_shared_readout, applied to (base_down, base_up) at the (larger) base rank."""
+        assert self.base_readout_rank > 0, "fit_base_readout requires base_readout_rank > 0"
+        r = self.base_readout_rank
+        dev = lm_head_weight.device
+        evals, evecs = torch.linalg.eigh(cov.float().to(dev))          # ascending, symmetric PSD
+        P = evecs[:, -r:]                                              # top-r principal directions (H, r)
+        if rotate:
+            Q, _ = torch.linalg.qr(torch.randn(r, r, device=dev, dtype=P.dtype))
+            P = P @ Q
+        up = lm_head_weight.detach().float() @ P                       # (V, r) = W P
+        self.base_down.weight.copy_(P.t().to(self.base_down.weight))   # (r, H) = P^T
+        self.base_up.weight.copy_(up.to(self.base_up.weight))          # (V, r)
 
 
 def markov_style_loss(draft_logits, target_logits, target_tokens, loss_weight,
@@ -263,27 +361,28 @@ def combined_training_loss(head, base_logits, h, g, gt_prev_ids, target_logits, 
     disable. consistency_weight=0 -> pure teacher-forced (unify to DSpark). Shapes: base_logits/
     target_logits (BN,block,V); h/g (BN,block,H); gt_prev_ids/target_tokens (BN,block); loss_weight
     (BN,block) = eval_mask."""
-    V = base_logits.shape[-1]
+    V = target_logits.shape[-1]           # base_logits is None in shared mode; target_logits has the same V
     w = build_loss_weight_mask(loss_weight, loss_decay_gamma).reshape(-1)  # == DSpark decayed mask
     tgt_l = target_logits.reshape(-1, V)
     tgt_t = target_tokens.reshape(-1).long()
 
-    refined_tf = head(base_logits, h, g, gt_prev_ids)  # teacher-forced pass
+    base_tf, refined_tf = head(base_logits, h, g, gt_prev_ids)  # teacher-forced pass; base_tf = shared base or echo
     loss_tf, ce_tf, l1_tf = markov_style_loss(refined_tf.reshape(-1, V), tgt_l, tgt_t, w,
                                               l1_alpha, ce_alpha)
     total = loss_tf
-    loss_cons = base_logits.new_zeros(())
+    loss_cons = refined_tf.new_zeros(())   # base_logits may be None (shared); refined_tf is always a tensor
     if consistency_weight > 0.0:
         # Seed prev = drafter's own argmax (== first Jacobi pass at inference), KEEPING the two known
         # slots (token-before-block, anchor) from the teacher-forced prev. Matches dflash_refiner_cotrain.
-        block = base_logits.shape[1]
-        base_pred = base_logits.detach().argmax(dim=-1)          # (BN, block) drafter argmax
+        block = base_tf.shape[1]                                 # base_tf = shared base or echoed lm_head(h)
+        base_pred = base_tf.detach().argmax(dim=-1)              # (BN, block) drafter argmax
         seed_prev = gt_prev_ids.clone()
         if block > 2:
             seed_prev[:, 2:] = base_pred[:, 1:block - 1]         # slots 0,1 stay correct
-        refined_seed = head(base_logits, h, g, seed_prev)
+        _, refined_seed = head(base_logits, h, g, seed_prev)
         loss_cons, _, _ = markov_style_loss(refined_seed.reshape(-1, V), tgt_l, tgt_t, w,
                                             l1_alpha, ce_alpha)
         total = loss_tf + consistency_weight * loss_cons
     return total, {"tf": loss_tf.detach(), "ce": ce_tf, "l1": l1_tf, "cons": loss_cons.detach(),
-                   "refined": refined_tf}  # refined_tf reused for the accuracy metric (no recompute)
+                   "refined": refined_tf,   # reused for the accuracy metric (no recompute)
+                   "base": base_tf}         # shared: head-computed base (=w2(ro_down(h))); else: echoed lm_head(h)
