@@ -96,7 +96,7 @@ class HybridRefinerHead(nn.Module):
                  input_mode: str = "concat", mixer_init: str = "eye",
                  use_norm: bool = True, use_mix_out: bool = True,
                  shared_readout: bool = False, base_readout_rank: int = 0,
-                 input_scale: float = 1.0,
+                 input_scale: float = 1.0, input_relu: bool = False,
                  initializer_range: float = 0.02):
         super().__init__()
         r = markov_rank
@@ -106,6 +106,11 @@ class HybridRefinerHead(nn.Module):
         # can also grow). 1.0 = unchanged; ~0.32 (=std*sqrt(r)) makes an ADD head's initial x match a
         # CONCAT head's -> tests whether concat's edge is the small INITIAL latent, not the in_proj itself.
         self.input_scale = float(input_scale)
+        # ReLU between the FIRST projections (down_*/W1) and the SECOND projection (in_proj), concat mode.
+        # A nonlinearity BREAKS the linear fold -> concat's "double projection" becomes a genuine 2-layer
+        # MLP (more expressive than project-then-add/add), not a foldable redundancy. Motivates keeping
+        # concat (empirically > add). No-op in add mode (no in_proj).
+        self.input_relu = bool(input_relu)
         self.vocab_size = int(vocab_size)
         self.hidden_size = int(hidden_size)
         self.markov_rank = r
@@ -247,16 +252,17 @@ class HybridRefinerHead(nn.Module):
             else:                                               # single source (perpos-only or global-only)
                 hid = self.down_h(h) if self.use_perpos else self.down_g(g)
             x = hid + markov_latent                             # add token residual-style
-        elif self.use_hidden:  # concat: active hidden projections + markov_latent -> in_proj
+        elif self.use_hidden:  # concat: active hidden projections + markov_latent -> [ReLU] -> in_proj
             parts = []
             if self.use_perpos:
                 parts.append(self.down_h(h))
             if self.use_global:
                 parts.append(self.down_g(g))
             parts.append(markov_latent)
-            x = self.in_proj(torch.cat(parts, dim=-1))
+            cat = torch.cat(parts, dim=-1)
+            x = self.in_proj(F.relu(cat) if self.input_relu else cat)   # ReLU -> 2-layer MLP (unfoldable)
         else:  # token-only
-            x = self.in_proj(markov_latent)
+            x = self.in_proj(F.relu(markov_latent) if self.input_relu else markov_latent)
         if self.use_mixer:
             m = self.input_norm(x) if self.use_norm else x
             m = self.mix(m)
