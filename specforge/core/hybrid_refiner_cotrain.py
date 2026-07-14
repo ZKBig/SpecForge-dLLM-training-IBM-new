@@ -204,10 +204,15 @@ class OnlineHybridRefinerCoTrain(nn.Module):
         h = f.output_hidden.view(B, n, block, H).reshape(BN, block, H)
         g = h.mean(dim=1, keepdim=True).expand(-1, block, -1)
         tgt = f.target_ids.reshape(BN, block)                  # [:,0] = real anchor
-        # SHARED: base via the head's shared readout w2(ro_down(h)); else full lm_head. (eval, no_grad ->
-        # calling the head method under SHARD_GRAD_OP full params is fine.)
-        base_logits = (self.refiner.readout_base(h) if self.use_lowrank_base
-                       else self._base_logits(h))               # [BN, block, V]
+        # base logits. LOW-RANK readout MUST go through the head's FORWARD (self.refiner(...)) so FSDP
+        # all-gathers the refiner params: a DIRECT self.refiner.readout_base(h) call does NOT trigger the
+        # gather, so under multi-GPU SHARD_GRAD_OP base_down/base_up (or ro_down/w2) are the sharded 0-size
+        # placeholders -> "vec (0)" size-mismatch crash at eval (1-GPU NO_SHARD masks it). Full lm_head base
+        # is FROZEN in the feature_extractor (NOT FSDP-wrapped) -> safe to call directly.
+        if self.use_lowrank_base:
+            base_logits = self.refiner(None, h, g, tgt)[0]       # [0]=base=readout_base(h); prev irrelevant to base
+        else:
+            base_logits = self._base_logits(h)                   # [BN, block, V]
 
         anchors = f.anchor_positions.reshape(BN, 1)
         pos_abs = anchors + torch.arange(block, device=device).view(1, block)
