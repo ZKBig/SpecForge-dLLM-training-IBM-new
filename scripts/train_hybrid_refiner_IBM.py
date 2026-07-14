@@ -120,6 +120,10 @@ def parse_args():
                                     "this (x starts smaller, then trains at normal rate). 1.0 = unchanged; "
                                     "~0.32 makes an ADD head's initial x match a CONCAT head's -> tests whether "
                                     "concat's edge is the small INITIAL latent, not the in_proj itself.")
+    refiner_group.add_argument("--input-relu", action="store_true",
+                               help="Add a ReLU between the first projections (down_*/W1) and in_proj (concat "
+                                    "mode). Breaks the linear fold -> concat becomes a genuine 2-layer MLP "
+                                    "(more expressive than add), motivating the double projection. No-op for add.")
     refiner_group.add_argument("--no-mixer", action="store_true", help="MLP-only SGU (no channel mixer).")
     refiner_group.add_argument("--no-mlp", action="store_true", help="Mixer-only SGU (no MLP).")
     refiner_group.add_argument("--mlp-ratio", type=int, default=4, help="SGU MLP hidden = ratio * r.")
@@ -618,6 +622,7 @@ def main():
         shared_readout_rank=args.lowrank_lmhead_shared_rank,
         base_readout_rank=args.lowrank_base_rank,
         input_scale=args.input_scale,
+        input_relu=args.input_relu,
         l1_alpha=args.l1_alpha,
         ce_alpha=args.ce_alpha,
         loss_decay_gamma=args.loss_decay_gamma,
