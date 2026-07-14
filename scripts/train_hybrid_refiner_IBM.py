@@ -115,6 +115,11 @@ def parse_args():
                                     "h + token). -> perpos-only head. Ignored if --no-hidden.")
     refiner_group.add_argument("--no-residual", action="store_true",
                                help="Drop the outer ReZero Markov-residual (Markov no longer the init).")
+    refiner_group.add_argument("--input-scale", type=float, default=1.0,
+                               help="INIT-ONLY initial-latent scale: scales the input-projection init std by "
+                                    "this (x starts smaller, then trains at normal rate). 1.0 = unchanged; "
+                                    "~0.32 makes an ADD head's initial x match a CONCAT head's -> tests whether "
+                                    "concat's edge is the small INITIAL latent, not the in_proj itself.")
     refiner_group.add_argument("--no-mixer", action="store_true", help="MLP-only SGU (no channel mixer).")
     refiner_group.add_argument("--no-mlp", action="store_true", help="Mixer-only SGU (no MLP).")
     refiner_group.add_argument("--mlp-ratio", type=int, default=4, help="SGU MLP hidden = ratio * r.")
@@ -612,6 +617,7 @@ def main():
         use_mix_out=not args.no_mix_out,
         shared_readout_rank=args.lowrank_lmhead_shared_rank,
         base_readout_rank=args.lowrank_base_rank,
+        input_scale=args.input_scale,
         l1_alpha=args.l1_alpha,
         ce_alpha=args.ce_alpha,
         loss_decay_gamma=args.loss_decay_gamma,
