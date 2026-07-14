@@ -96,9 +96,16 @@ class HybridRefinerHead(nn.Module):
                  input_mode: str = "concat", mixer_init: str = "eye",
                  use_norm: bool = True, use_mix_out: bool = True,
                  shared_readout: bool = False, base_readout_rank: int = 0,
+                 input_scale: float = 1.0,
                  initializer_range: float = 0.02):
         super().__init__()
         r = markov_rank
+        # EXPLICIT initial-latent scale (INIT-ONLY): scales the input-projection init std (down_*/in_proj)
+        # by this factor -> the SGU input x STARTS smaller but the weights then train at the NORMAL rate
+        # (grow freely), faithfully mirroring how concat's small x arises from a small-init in_proj (which
+        # can also grow). 1.0 = unchanged; ~0.32 (=std*sqrt(r)) makes an ADD head's initial x match a
+        # CONCAT head's -> tests whether concat's edge is the small INITIAL latent, not the in_proj itself.
+        self.input_scale = float(input_scale)
         self.vocab_size = int(vocab_size)
         self.hidden_size = int(hidden_size)
         self.markov_rank = r
@@ -209,16 +216,21 @@ class HybridRefinerHead(nn.Module):
             nn.init.zeros_(self.w1.weight)                   # code starts 0 -> refined == base at init
             nn.init.normal_(self.ro_down.weight, mean=0.0, std=std)   # overwritten by fit_shared_readout
         else:
-            nn.init.normal_(self.w1.weight, mean=0.0, std=std)   # markov_w1  (== DeepSpec)
+            # W1 (markov down-embed): with NO residual it feeds ONLY the SGU input x, so the initial-latent
+            # input_scale shrinks it too -> ALL 3 sources (h, g, markov) match a concat head. WITH residual
+            # W1 ALSO = the outer Markov latent -> keep it at full std (don't touch the Markov backbone).
+            w1_std = std * self.input_scale if (self.sgu_enabled and not self.use_residual) else std
+            nn.init.normal_(self.w1.weight, mean=0.0, std=w1_std)   # markov_w1 (== DeepSpec at scale 1.0)
         nn.init.normal_(self.w2.weight, mean=0.0, std=std)   # markov_w2 (== DeepSpec; overwritten by fit if shared)
         if self.base_readout_rank > 0:
             nn.init.normal_(self.base_down.weight, mean=0.0, std=std)  # both overwritten by fit_base_readout;
             nn.init.zeros_(self.base_up.weight)                        # zeros -> base=0 until calibration-fit
         if self.sgu_enabled:
+            in_std = std * self.input_scale                            # INIT-ONLY initial-latent scale
             for _name in ("down_hg", "down_h", "down_g", "in_proj"):   # whichever input projections exist
                 _mod = getattr(self, _name, None)
                 if _mod is not None:
-                    nn.init.normal_(_mod.weight, mean=0.0, std=std)
+                    nn.init.normal_(_mod.weight, mean=0.0, std=in_std)
             if self.use_mixer and self.use_mix_out:
                 nn.init.normal_(self.mix_out.weight, mean=0.0, std=std)
                 # mixer L stays init'd per mixer_init; norms (if any) stay ones; res_gate stays zero.
