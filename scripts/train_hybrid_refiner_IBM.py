@@ -107,6 +107,12 @@ def parse_args():
                                help="Train the pure Markov head (DSpark VanillaMarkov special case; SGU off).")
     refiner_group.add_argument("--no-hidden", action="store_true",
                                help="Token-only SGU input (drop h/g; use prev-token W1 only).")
+    refiner_group.add_argument("--no-perpos", action="store_true",
+                               help="Drop the per-position hidden h from the SGU input (keep global g + token). "
+                                    "-> global-only head. Ignored if --no-hidden.")
+    refiner_group.add_argument("--no-global", action="store_true",
+                               help="Drop the block-summary g (=mean_pos h) from the SGU input (keep per-position "
+                                    "h + token). -> perpos-only head. Ignored if --no-hidden.")
     refiner_group.add_argument("--no-residual", action="store_true",
                                help="Drop the outer ReZero Markov-residual (Markov no longer the init).")
     refiner_group.add_argument("--no-mixer", action="store_true", help="MLP-only SGU (no channel mixer).")
@@ -152,10 +158,28 @@ def parse_args():
         "Exclusive with --lowrank-lmhead-rank (that only low-ranks the delta). Try 512.",
     )
     refiner_group.add_argument(
+        "--lowrank-base-rank", type=int, default=0,
+        help="SEPARATE (non-shared) low-rank base readout of this rank for the DRAFTER base ONLY, while the "
+        "refiner keeps --markov-rank. Decouples base accept (use 512/1024) from refiner latency (256). Uses "
+        "the SAME inline calibration as --lowrank-lmhead-shared-rank. Mutually exclusive with it.",
+    )
+    refiner_group.add_argument(
         "--lowrank-lmhead-shared-cov", type=str, default=None,
         help="Path to an activation-covariance .pt (collect_covariance.py --calib-target hidden) to "
-        "DATA-PCA-init the shared low-rank lm_head. Omit -> SVD-of-weight warm-start (worse; the whole "
-        "point is that hidden activations are low-rank even though the weight is not).",
+        "DATA-PCA-init the shared low-rank lm_head. If the path EXISTS it is loaded; if it does NOT exist "
+        "(or is omitted) the covariance is COLLECTED INLINE from --lowrank-calib-batches training batches "
+        "and saved to this path (if given). The whole point: hidden activations are low-rank even though "
+        "the weight is not.",
+    )
+    refiner_group.add_argument(
+        "--lowrank-calib-batches", type=int, default=32,
+        help="#training batches to accumulate the activation covariance C=sum h h^T for the INLINE "
+        "DATA-PCA init of the shared low-rank base readout (used when --lowrank-lmhead-shared-rank>0 and "
+        "no existing --lowrank-lmhead-shared-cov file).",
+    )
+    refiner_group.add_argument(
+        "--lowrank-calib-rotate", action="store_true",
+        help="Random-rotate the PCA subspace when fitting the low-rank base readout (bf16 precision).",
     )
     refiner_group.add_argument(
         "--consistency-weight", type=float, default=0.0,
@@ -265,6 +289,10 @@ def parse_args():
     output_group.add_argument("--cache-dir", type=str, default="./cache")
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--save-interval", type=int, default=1000)
+    output_group.add_argument("--keep-last-n-checkpoints", type=int, default=2,
+                              help="After saving, delete older epoch_*_step_* dirs, keeping only the "
+                              "last N (each ckpt ~16GB: drafter+head+8 optim shards). 0 = keep all "
+                              "(WILL fill /gpfs). Latest is always kept so --resume works.")
     output_group.add_argument("--eval-interval", type=int, default=1000)
 
     optimization_group = parser.add_argument_group("optimization")
@@ -338,7 +366,7 @@ def build_dataloader(args, tokenizer, block_size) -> Tuple[DataLoader, Optional[
     return train_dataloader, eval_dataloader
 
 
-def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
+def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer, base_readout_fsdp=None):
     """Save the refiner AND the co-trained drafter (+ optimizer/scheduler state).
 
     Both state_dict() calls are collectives -> every rank must enter them; only rank 0
@@ -354,6 +382,10 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
         refiner_state_dict = refiner_fsdp.state_dict()
     with FSDP.state_dict_type(draft_fsdp, StateDictType.FULL_STATE_DICT):
         draft_state_dict = draft_fsdp.state_dict()
+    base_readout_state_dict = None                       # collective -> ALL ranks enter if present
+    if base_readout_fsdp is not None:
+        with FSDP.state_dict_type(base_readout_fsdp, StateDictType.FULL_STATE_DICT):
+            base_readout_state_dict = base_readout_fsdp.state_dict()
 
     if dist.get_rank() == 0:
         torch.save(
@@ -372,8 +404,10 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
                 "mlp_intermediate": args.mlp_intermediate,
                 "lowrank_lmhead_rank": args.lowrank_lmhead_rank,
                 "lowrank_lmhead_init": args.lowrank_lmhead_init,
+                "lowrank_lmhead_shared_rank": args.lowrank_lmhead_shared_rank,
                 "refiner_state_dict": refiner_state_dict,
                 "draft_state_dict": draft_state_dict,
+                "base_readout_state_dict": base_readout_state_dict,   # low-rank base readout (None if off)
                 # Scheduler is REPLICATED across ranks -> store it in the rank-0 file.
                 # The optimizer (Adam) state is FSDP-SHARDED (per-rank, different sizes)
                 # because fp32_params clone the LOCAL FSDP shards -> saved per-rank below.
@@ -389,6 +423,21 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
         {"optimizer_state_dict": optimizer.optimizer.state_dict()},
         os.path.join(save_dir, f"optim_rank{dist.get_rank()}.pt"),
     )
+    dist.barrier()
+
+    # Rotation: keep only the last N checkpoints so /gpfs doesn't fill up (each ckpt ~16GB =
+    # drafter 1.05B + head + 8 optim shards). Latest (highest global_step) is always kept -> --resume ok.
+    keep = getattr(args, "keep_last_n_checkpoints", 0)
+    if dist.get_rank() == 0 and keep and keep > 0:
+        import re
+        import shutil
+        ckpts = [d for d in os.listdir(args.output_dir)
+                 if re.fullmatch(r"epoch_\d+_step_\d+", d)
+                 and os.path.isdir(os.path.join(args.output_dir, d))]
+        ckpts.sort(key=lambda d: int(d.rsplit("_step_", 1)[1]))   # global_step is monotonic across epochs
+        for old in ckpts[:-keep]:
+            shutil.rmtree(os.path.join(args.output_dir, old), ignore_errors=True)
+            print_on_rank0(f"[ckpt-rotate] removed old checkpoint {old} (keep last {keep})")
     dist.barrier()
 
 
@@ -551,6 +600,8 @@ def main():
         markov_rank=args.markov_rank,
         sgu_enabled=not args.markov_only,
         use_hidden=not args.no_hidden,
+        use_perpos=not args.no_perpos,
+        use_global=not args.no_global,
         use_residual=not args.no_residual,
         use_mixer=not args.no_mixer,
         use_mlp=not args.no_mlp,
@@ -559,6 +610,8 @@ def main():
         mixer_init=args.mixer_init,
         use_norm=not args.no_sublayer_norm,
         use_mix_out=not args.no_mix_out,
+        shared_readout_rank=args.lowrank_lmhead_shared_rank,
+        base_readout_rank=args.lowrank_base_rank,
         l1_alpha=args.l1_alpha,
         ce_alpha=args.ce_alpha,
         loss_decay_gamma=args.loss_decay_gamma,
@@ -572,7 +625,8 @@ def main():
             "\n==================== HYBRID HEAD ARCH ====================\n"
             f"  head         = {head}\n"
             f"  markov_rank  = {args.markov_rank}   input_mode = {args.input_mode}   mixer_init = {args.mixer_init}\n"
-            f"  use_hidden={not args.no_hidden}  use_mixer={not args.no_mixer}  use_mlp={not args.no_mlp}  "
+            f"  use_perpos={not args.no_hidden and not args.no_perpos}  use_global={not args.no_hidden and not args.no_global}  "
+            f"use_mixer={not args.no_mixer}  use_mlp={not args.no_mlp}  "
             f"use_residual={not args.no_residual}  mlp_ratio={args.mlp_ratio}\n"
             f"  loss: ce_alpha={args.ce_alpha} l1_alpha={args.l1_alpha} decay_gamma={args.loss_decay_gamma} "
             f"consistency_weight={args.consistency_weight}   (DSpark: ce0.1/l1_0.9/gamma4)\n"
@@ -583,6 +637,71 @@ def main():
             "=========================================================\n",
             flush=True,
         )
+
+    # rank >= hidden -> the wrapper normalized base_readout_rank to 0 (full FROZEN lm_head base, no training).
+    _H_lr = refiner_model.feature_extractor.lm_head.weight.shape[1]
+    if args.lowrank_base_rank > 0 and refiner_model.base_readout_rank == 0:
+        log_print(f"[lowrank-base] --lowrank-base-rank {args.lowrank_base_rank} >= hidden {_H_lr} -> FULL frozen "
+                  f"lm_head base (no low-rank readout, no training; = the full-rank control).")
+
+    # --- LOW-RANK BASE READOUT (data-PCA / calibration init) -- BEFORE FSDP so the drafter is unsharded ---
+    # Trigger on use_lowrank_base so a rank>=H fallback (-> full lm_head) correctly SKIPS calibration/fit.
+    if refiner_model.use_lowrank_base:
+        assert args.drafter_lr_scale == 1.0, \
+            "--lowrank-lmhead-shared-rank / --lowrank-base-rank support single-LR only (set --drafter-lr-scale 1.0)."
+        V_lr, H_lr = refiner_model.feature_extractor.lm_head.weight.shape   # (V, H)
+        cov_path = args.lowrank_lmhead_shared_cov
+        if cov_path and os.path.exists(cov_path):
+            _c = torch.load(cov_path, map_location="cpu", weights_only=False)
+            C = (_c["C"] if isinstance(_c, dict) else _c).float().cuda()
+            log_print(f"[lowrank-base] loaded calibration covariance from {cov_path}")
+        else:
+            log_print(f"[lowrank-base] collecting activation covariance over "
+                      f"{args.lowrank_calib_batches} batches (h=drafter hidden) ...")
+            C = torch.zeros(H_lr, H_lr, dtype=torch.float64, device="cuda")
+            n_vec = 0
+            refiner_model.eval()
+            with torch.no_grad():
+                for bi, data in enumerate(train_dataloader):
+                    if bi >= args.lowrank_calib_batches:
+                        break
+                    iid = data["input_ids"].cuda()
+                    am = data["attention_mask"].cuda()
+                    lm = data["loss_mask"].cuda()
+                    tout = target_model.generate_dflash_data(iid, am, lm)
+                    f = refiner_model.feature_extractor.compute_block_features(
+                        iid, tout.hidden_states.cuda(), lm)
+                    hh = f.output_hidden.reshape(-1, H_lr).double()          # (N, H) readout inputs
+                    C += hh.t() @ hh
+                    n_vec += hh.shape[0]
+            refiner_model.train()
+            if dist.get_world_size() > 1:
+                dist.all_reduce(C)                                          # global covariance across DP ranks
+            C = C.float()
+            log_print(f"[lowrank-base] covariance collected (~{n_vec} vectors/rank)")
+            if cov_path and dist.get_rank() == 0:
+                os.makedirs(os.path.dirname(cov_path) or ".", exist_ok=True)
+                torch.save({"C": C.cpu(), "hidden_size": H_lr}, cov_path)
+                log_print(f"[lowrank-base] saved covariance -> {cov_path}")
+        # eigh sign/degeneracy AND --lowrank-calib-rotate's randn(r,r) can differ per GPU -> force rank-0's
+        # fit onto all ranks so FSDP shards a consistent tensor. (set_seed makes the rest identical already.)
+        if args.lowrank_lmhead_shared_rank > 0:
+            refiner_model.init_shared_readout(C, rotate=args.lowrank_calib_rotate)   # fits head.w2 (up) + ro_down
+            fit_params = (refiner_model.refiner.w2.weight, refiner_model.refiner.ro_down.weight)
+            ready_msg = (f"[lowrank-base] SHARED low-rank readout ready: rank={args.lowrank_lmhead_shared_rank} "
+                         f"ro_down{tuple(refiner_model.refiner.ro_down.weight.shape)} "
+                         f"w2(up){tuple(refiner_model.refiner.w2.weight.shape)}")
+        else:
+            refiner_model.init_base_readout(C, rotate=args.lowrank_calib_rotate)     # fits head.base_down + base_up
+            fit_params = (refiner_model.refiner.base_up.weight, refiner_model.refiner.base_down.weight)
+            ready_msg = (f"[lowrank-base] SEPARATE low-rank base readout ready: rank={args.lowrank_base_rank} "
+                         f"base_down{tuple(refiner_model.refiner.base_down.weight.shape)} "
+                         f"base_up{tuple(refiner_model.refiner.base_up.weight.shape)} (refiner rank={args.markov_rank})")
+        if dist.get_world_size() > 1:
+            for p in fit_params:
+                dist.broadcast(p.data, src=0)
+        del C
+        log_print(ready_msg)
 
     # FSDP-wrap BOTH trainable modules: the refiner head AND the drafter backbone.
     refiner_model.refiner = FSDP(
@@ -597,7 +716,11 @@ def main():
         mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
     )
-    print_with_rank("Initialized FSDP (refiner head + drafter)")
+    # NOTE: the SHARED low-rank readout (w2 + ro_down) lives INSIDE the head (refiner) -> it's already
+    # FSDP-wrapped above, already in the optimizer (refiner), and saved in refiner_state_dict. No extra unit.
+    print_with_rank("Initialized FSDP (refiner head + drafter)"
+                    + (f"  [shared low-rank readout r={args.lowrank_lmhead_shared_rank}]"
+                       if args.lowrank_lmhead_shared_rank > 0 else ""))
 
     # optimizer over both FSDP units. drafter-lr-scale != 1.0 -> 2 param groups
     # (head at lr, drafter at lr*scale); == 1.0 -> single shared LR.
@@ -614,6 +737,7 @@ def main():
         print_on_rank0(f"Optimizer: 2 groups (head lr={args.learning_rate}, "
                        f"drafter lr={args.learning_rate * args.drafter_lr_scale})")
     else:
+        # refiner already contains the shared low-rank readout (w2 + ro_down) -> trained here, no extra module.
         trainable = nn.ModuleList(
             [refiner_model.refiner, refiner_model.feature_extractor.draft_model]
         )
@@ -647,6 +771,7 @@ def main():
                     refiner_model.feature_extractor.draft_model.load_state_dict(
                         state["draft_state_dict"]
                     )
+            # (shared low-rank readout is inside refiner -> already restored via refiner_state_dict above.)
             # CRITICAL: the BF16 optimizer holds fp32 MASTER copies cloned at construction
             # (pre-resume init weights). The load_state_dict calls above updated the model's
             # p.data but NOT these masters. On the first step(), p.data.copy_(master) would
