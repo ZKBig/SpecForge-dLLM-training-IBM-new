@@ -116,9 +116,25 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         super().set_capture_layers(layer_ids)
-        if hasattr(self.model_runner.model, "set_eagle3_layers_to_capture"):
-            self.model_runner.model.set_eagle3_layers_to_capture(layer_ids)
-            print(self.model_runner.model.model.layers_to_capture)
+        # sglang renamed this hook: newer models (e.g. qwen3_5, added in 0.5.12) expose
+        # set_dflash_layers_to_capture, older ones (llama, qwen3, qwen2_moe in 0.5.9) expose
+        # set_eagle3_layers_to_capture. Try both. RAISE if neither exists -- the previous
+        # bare hasattr() check silently did nothing on unsupported models, and the failure then
+        # surfaced far away as a drafter shape mismatch (it gets a single 2048-dim layer instead
+        # of the concatenated target_layer_ids), which is very hard to trace back to here.
+        for _hook in ("set_dflash_layers_to_capture", "set_eagle3_layers_to_capture"):
+            if hasattr(self.model_runner.model, _hook):
+                getattr(self.model_runner.model, _hook)(layer_ids)
+                print(f"[capture] {_hook}({layer_ids}) -> "
+                      f"{getattr(self.model_runner.model.model, 'layers_to_capture', '?')}")
+                return
+        raise RuntimeError(
+            f"{type(self.model_runner.model).__name__} exposes neither "
+            "set_dflash_layers_to_capture nor set_eagle3_layers_to_capture, so the target's "
+            "multi-layer hidden states cannot be captured and the drafter would receive the "
+            "wrong input width. Upgrade sglang (qwen3.5 support landed in 0.5.12) or add the "
+            "capture hook to that model."
+        )
 
     @torch.no_grad
     def _extend(self, reqs):

@@ -1,3 +1,4 @@
+import inspect
 import logging
 from typing import Optional
 
@@ -16,6 +17,29 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 from specforge.distributed import get_tp_group as get_specforge_tp_group
+
+
+def _init_model_parallel_group_compat(*args, **kwargs):
+    """init_model_parallel_group() with version-tolerant keyword arguments.
+
+    This module mirrors sglang internals, so signatures drift between releases:
+    `pynccl_use_current_stream` exists in 0.5.9 but was removed by 0.5.14. Silently dropping an
+    unknown kwarg would be wrong if it carried a real setting, so drop it ONLY when it is falsy
+    (the default path) and raise otherwise, rather than quietly changing behaviour.
+    """
+    params = inspect.signature(init_model_parallel_group).parameters
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        unsupported = {k: v for k, v in kwargs.items() if k not in params}
+        meaningful = {k: v for k, v in unsupported.items() if v}
+        if meaningful:
+            raise TypeError(
+                "the installed sglang's init_model_parallel_group() does not accept "
+                f"{sorted(meaningful)} (values {meaningful}); dropping them would change "
+                "behaviour, so patch.py needs updating for this sglang version."
+            )
+        for k in unsupported:
+            kwargs.pop(k)
+    return init_model_parallel_group(*args, **kwargs)
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +156,7 @@ def initialize_model_parallel(
 
     # message queue broadcaster is only used in tensor model parallel group
     # NOTE: torch_compile parameter was removed in sglang 0.5.9
-    parallel_state._TP = init_model_parallel_group(
+    parallel_state._TP = _init_model_parallel_group_compat(
         group_ranks,
         parallel_state._WORLD.local_rank,
         backend,
@@ -148,7 +172,7 @@ def initialize_model_parallel(
             parallel_state._PDMUX_PREFILL_TP_GROUP is None
         ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
         # NOTE: torch_compile parameter was removed in sglang 0.5.9
-        parallel_state._PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
+        parallel_state._PDMUX_PREFILL_TP_GROUP = _init_model_parallel_group_compat(
             group_ranks,
             parallel_state._WORLD.local_rank,
             backend,
@@ -356,13 +380,18 @@ def initialize_dp_attention(
     dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     # NOTE: Added attn_cp_size parameter for sglang 0.5.9
+    # Arity differs by version: 0.5.9 returns 3 values, 0.5.14 returns 4 (it appends
+    # attn_dp_size). Slice the first three instead of unpacking a fixed count. Dropping the 4th
+    # is safe rather than lossy: _ATTN_DP_SIZE is assigned explicitly in BOTH branches below
+    # (dp_size when DP attention is on, 1 when off), so the returned value is redundant here.
+    _world_info = compute_dp_attention_world_info(
+        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
+    )
     (
         dp_attention._ATTN_TP_RANK,
         dp_attention._ATTN_TP_SIZE,
         dp_attention._ATTN_DP_RANK,
-    ) = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
-    )
+    ) = _world_info[:3]
     _, _, dp_attention._LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
     )

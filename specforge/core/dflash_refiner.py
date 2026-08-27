@@ -101,8 +101,21 @@ class DFlashFeatureExtractor(OnlineDFlashModel):
             attention_mask=dflash_attn_mask,
         )
 
-        # --- same-position labels: position k -> token at anchor+k ---
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        # --- label alignment: convention-gated ---
+        # fillin (z-lab style, default): slot k -> token AT anchor+k; slot 0 reproduces the
+        #   known anchor and is excluded from the loss -> block_size-1 supervised slots.
+        # shift (deepseek/DeepSpec style): slot k -> token AFTER its position, i.e. anchor+k+1;
+        #   EVERY slot is supervised (block_size predictions from the same input layout).
+        # The drafter INPUT ([anchor, mask x (B-1)], attention, position ids) is identical in
+        # both conventions -- only the supervision targets move, which is what makes deepseek's
+        # shift-native checkpoints warm-startable without the retrofit hole (measured: a fillin
+        # retrofit of dflash_qwen3_8b_block7 caps the standalone drafter at ~3.9 accept vs its
+        # native 5.43).
+        shift = getattr(self, "block_convention", "fillin") == "shift"
+        first_offset = 1 if shift else 0
+        label_offsets = torch.arange(
+            first_offset, self.block_size + first_offset, device=device
+        ).view(1, 1, -1)
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
         valid_label_mask = label_indices < seq_len
         safe_label_indices = label_indices.clamp(max=seq_len - 1)
@@ -111,11 +124,12 @@ class DFlashFeatureExtractor(OnlineDFlashModel):
             input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
 
-        # --- 0/1 validity mask: real block * in-bounds * exclude anchor(pos 0) * assistant ---
+        # --- 0/1 validity mask: real block * in-bounds * assistant (* exclude-anchor, fillin) ---
         binary_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
         binary_mask = binary_mask * valid_label_mask.float()
-        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        binary_mask = binary_mask * (pos_in_block > 0).float()
+        if not shift:
+            pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+            binary_mask = binary_mask * (pos_in_block > 0).float()
         loss_mask_gathered = torch.gather(
             loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )

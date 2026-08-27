@@ -45,6 +45,21 @@ logger = logging.getLogger(__name__)
 
 class SGLangRunner(ModelRunner):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # sglang 0.5.14 moved KV-cache pool allocation OUT of ModelRunner.__init__ into a separate
+        # alloc_memory_pool(), which is normally driven by TpModelWorker. specforge constructs the
+        # runner directly and never goes through a worker, so nothing allocates the pools:
+        # req_to_token_pool stays None and ScheduleBatch.init_new() dies on
+        # `req_to_token_pool.device`. Allocate it here, matching how tp_worker.py calls it
+        # (memory_pool_config=None -> the default stored on the runner).
+        # sglang <= 0.5.11 allocates inside __init__ and has no such method, hence both guards.
+        if getattr(self, "req_to_token_pool", None) is None and hasattr(
+            self, "alloc_memory_pool"
+        ):
+            logger.info("Allocating KV cache memory pool (sglang >= 0.5.12 code path).")
+            self.alloc_memory_pool()
+
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 

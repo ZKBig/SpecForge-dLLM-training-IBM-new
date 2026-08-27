@@ -1,0 +1,139 @@
+serviceAccountName: "gdr"
+namespace: platform
+jobName: zwang-xpress-s1-b16warm-sgu-consis-k3
+priority: high-priority
+
+containerImage: us.icr.io/cil15-shared-registry/platform/goon-torch-dev:latest
+restartPolicy: Never
+
+# GLOBAL BATCH = numPods x 8 x batch-size x accumulation-steps.
+# The validated LSF run of this recipe was `bash submit.sh 2 xpress
+# hybrid-s1-b16warm-sgu-linear-mixer-consis-k3`, i.e. 2 nodes x 8 GPUs x bs 1 x accum 1
+# = 16, and LR 6e-4 was tuned at that batch. numPods: 2 reproduces it exactly; at
+# numPods: 4 the global batch doubles to 32 and the LR would need revisiting (accum is
+# already 1, so it cannot be halved to compensate).
+numPods: 2
+numCpusPerPod: 72
+numGpusPerPod: 8
+totalMemoryPerPod: 1000Gi
+
+environmentVariables:
+  - name: HF_HOME
+    value: /gpfs/zwang33/hf_cache
+  - name: TORCHINDUCTOR_CACHE_DIR
+    value: /gpfs/zwang33/cache/compiled_kernels
+  - name: SPECFORGE_DATA_NUM_PROC
+    value: "32"
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: NCCL_IB_HCA
+    value: mlx5_0,mlx5_3
+  - name: NCCL_IB_QPS_PER_CONNECTION
+    value: "8"
+  - name: NCCL_IB_SPLIT_DATA_ON_QPS
+    value: "0"
+  - name: NCCL_IB_PCI_RELAXED_ORDERING
+    value: "1"
+  - name: NCCL_IB_GID_INDEX
+    value: "3"
+  - name: NCCL_SOCKET_IFNAME
+    value: eth0
+  - name: NCCL_ALGO
+    value: Ring
+  - name: NCCL_IGNORE_CPU_AFFINITY
+    value: "1"
+  - name: NCCL_DEBUG_SUBSYS
+    value: INIT,GRAPH,ENV,TUNING
+  - name: NCCL_IB_DISABLE
+    value: "0"
+  - name: NCCL_SOCKET_NTHREADS
+    value: "2"
+  - name: NCCL_CROSS_NIC
+    value: "0"
+  - name: NCCL_DEBUG
+    value: WARN
+  - name: OMP_NUM_THREADS
+    value: "16"
+  - name: NCCL_BUFFSIZE
+    value: "8388608"
+  - name: CUDA_VISIBLE_DEVICES
+    value: 0,1,2,3,4,5,6,7
+  # The XPress loss runs close to the card's capacity; expandable_segments avoids
+  # fragmentation OOM. (Present in the LSF version of this recipe, not in s2.)
+  - name: PYTORCH_CUDA_ALLOC_CONF
+    value: expandable_segments:True
+
+setupCommands:
+  # Export WANDB_API_KEY in the submitting shell -- do NOT hardcode it here the way the
+  # repo's *.sh scripts do; this file is committed.
+  - test -n "$WANDB_API_KEY" || { echo "FATAL: export WANDB_API_KEY before submitting" >&2; exit 1; }
+  - pip install sglang==0.5.9 openai accelerate
+  - rm -rf SpecForge-dLLM-training-IBM
+  # ZKBig/SpecForge-dLLM-training-IBM is not anonymously clonable today (the older
+  # SpecForge-dLLM-training was, when the s2 job ran). Use GITHUB_TOKEN when it is set
+  # and fall back to a plain clone, so this works either way.
+  - if [ -n "$GITHUB_TOKEN" ]; then git clone https://x-access-token:${GITHUB_TOKEN}@github.com/ZKBig/SpecForge-dLLM-training-IBM.git; else git clone https://github.com/ZKBig/SpecForge-dLLM-training-IBM.git; fi
+  - cd SpecForge-dLLM-training-IBM
+  - pip install -e .
+
+# XPress: the hybrid-s1-b16warm-sgu-linear-mixer-consis-k3 recipe -- the run that
+# produced the released Qwen3-8B b16 checkpoint. Differences from s2-b16dspark-sgu:
+#   * the released XPress head shape: --no-sublayer-norm --no-mix-out --no-residual
+#     --mixer-init zeros
+#   * K=3 Jacobi consistency rounds: --consistency-weight 0.3 --consistency-passes 3
+#   * warm-started (NOT --random-init-drafter) with the base-anchor schedule
+#     0.6 -> 0.2, which holds the co-trained drafter to the target
+#   * --num-anchors 400, --batch-size 1, --save-interval 10000
+mainProgram: >
+  scripts/train_hybrid_refiner_IBM.py
+  --l1-alpha 0.9
+  --ce-alpha 0.1
+  --loss-decay-gamma 4.0
+  --markov-rank 256
+  --learning-rate 0.0006
+  --num-anchors 400
+  --max-length 4096
+  --batch-size 1
+  --accumulation-steps 1
+  --num-epochs 10
+  --eval-interval 1000
+  --target-model-path /gpfs/zwang33/models/Qwen3-8B
+  --train-data-path /gpfs/zwang33/dflash_data/refiner_train_nothink.jsonl
+  --eval-data-path /gpfs/zwang33/dflash_data/refiner_eval_nothink.jsonl
+  --cache-dir /gpfs/zwang33/cache
+  --chat-template qwen
+  --attention-backend sdpa
+  --warmup-ratio 0.04
+  --max-grad-norm 1.0
+  --tp-size 1
+  --log-interval 50
+  --save-interval 10000
+  --dflash-model-path z-lab/Qwen3-8B-DFlash-b16
+  --lambda-base-start 0.6
+  --lambda-base-floor 0.2
+  --lambda-base-decay-ratio 1.0
+  --no-sublayer-norm
+  --no-mix-out
+  --no-residual
+  --consistency-weight 0.3
+  --consistency-passes 3
+  --mixer-init zeros
+  --output-dir /gpfs/zwang33/hybrid_out/xpress-s1-b16warm-sgu-consis-k3
+  --report-to wandb
+  --wandb-project ripple-dspark
+  --wandb-name xpress-s1-b16warm-sgu-consis-k3
+  --resume
+
+imagePullSecrets:
+  - name: all-icr-io
+
+volumes:
+  - name: datasets
+    claimName: platform-dataset-1
+    mountPath: /datasets
+  - name: checkpoints
+    claimName: platform-checkpoints
+    mountPath: /gpfs
+
+warmupGracePeriodDuration: 20m
+deletionOnFailureGracePeriodDuration: 10m

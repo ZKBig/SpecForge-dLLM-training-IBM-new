@@ -30,6 +30,7 @@ faithful DSpark); SGU -> parallel K-pass Jacobi (prev = previous pass's token).
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class RMSNorm(nn.Module):
@@ -97,9 +98,30 @@ class HybridRefinerHead(nn.Module):
                  use_norm: bool = True, use_mix_out: bool = True,
                  shared_readout: bool = False, base_readout_rank: int = 0,
                  input_scale: float = 1.0, input_relu: bool = False,
-                 initializer_range: float = 0.02):
+                 initializer_range: float = 0.02, confidence_mode: str = "off"):
         super().__init__()
         r = markov_rank
+        # OPTIONAL confidence head predicting per-slot acceptance probability, two modes:
+        #   "trajectory" (plan A, ours): small MLP over the head's DETACHED causal-mixed r-dim
+        #       latent -- sees ALL previous block tokens; gradients train ONLY the conf MLP.
+        #       Inference-time early stopping without touching the main objective.
+        #   "dspark" (official DSpark, coupled): EXACT official architecture -- a single
+        #       Linear(H + r, 1) over cat([h, W1[prev]]) (AcceptRatePredictor with
+        #       confidence_head_with_markov=True), NO detach: its gradients flow into the
+        #       drafter backbone and W1 exactly like official alpha=1.0 training. Use for
+        #       faithful reproduction arms.
+        #   "off" (default): NO module -> state_dict/behaviour bit-identical to older runs.
+        assert confidence_mode in ("off", "trajectory", "dspark"), confidence_mode
+        self.confidence_mode = str(confidence_mode)
+        self.conf_head = None
+        if self.confidence_mode == "trajectory":
+            self.conf_head = nn.Sequential(
+                nn.Linear(r, r, bias=False), nn.SiLU(), nn.Linear(r, 1, bias=True))
+            # start near the empirical mean acceptance (~0.8 -> logit 1.4): calibrates faster
+            # and never swamps early training with huge BCE gradients.
+            nn.init.constant_(self.conf_head[-1].bias, 1.4)
+        elif self.confidence_mode == "dspark":
+            self.conf_head = nn.Linear(hidden_size + r, 1)   # official AcceptRatePredictor
         # EXPLICIT initial-latent scale (INIT-ONLY): scales the input-projection init std (down_*/in_proj)
         # by this factor -> the SGU input x STARTS smaller but the weights then train at the NORMAL rate
         # (grow freely), faithfully mirroring how concat's small x arises from a small-init in_proj (which
@@ -115,9 +137,9 @@ class HybridRefinerHead(nn.Module):
         self.hidden_size = int(hidden_size)
         self.markov_rank = r
         self.initializer_range = float(initializer_range)
-        # NOTE: DSpark's released Qwen3-8B also trains a confidence head (alpha=1.0) for inference
-        # SCHEDULING; we deliberately OMIT it from BOTH heads. It's orthogonal to the fixed-block
-        # accept-rate comparison, and excluding it identically keeps the head-vs-head test clean.
+        # NOTE: DSpark's released checkpoints also train a confidence head (alpha=1.0) for
+        # inference SCHEDULING. Ours is OPT-IN via confidence=True above (trajectory-aware,
+        # detached); the default-off keeps fixed-block head-vs-head comparisons clean.
         self.sgu_enabled = bool(sgu_enabled)
         # Hidden sources split into two ABLATABLE flags: use_perpos (per-position drafter hidden h) and
         # use_global (block-summary g = mean_pos(h)). use_hidden=False forces token-only (both off) for
@@ -284,6 +306,28 @@ class HybridRefinerHead(nn.Module):
             return markov_latent + self.res_gate * refined  # starts as Markov, learns SGU on top
         return refined
 
+    def confidence_logits(self, h, g, prev_token_ids, detach: bool = False):
+        """Per-slot acceptance-confidence logits (BN, block, 1). JOINTLY TRAINED by default
+        (detach=False): like official DSpark alpha=1.0, the BCE gradients flow through the
+        input features into the main head / drafter backbone (the auxiliary "will this be
+        accepted?" task shapes the representation). detach=True cuts that coupling and
+        trains only the conf module (inference-only calibration).
+
+        Mode "trajectory" (ours): input = the head's causal-mixed r-dim latent, so slot k
+        sees ALL previous block tokens -- unlike DSpark's [h, prev_embed] input, which is
+        blind beyond one token and measurably overconfident at depth (official 14B ECE
+        0.019@0 -> 0.101@6, +10pp bias at slot 6).
+        Mode "dspark" (official): input = cat([h, W1[prev]]) into Linear(H+r, 1) -- the
+        exact AcceptRatePredictor with confidence_head_with_markov=True."""
+        assert self.conf_head is not None, "head built with confidence_mode='off'"
+        if self.confidence_mode == "dspark":
+            feats = torch.cat([h, self.w1(prev_token_ids.long())], dim=-1)
+        else:
+            feats = self.compute_latent(h, g, prev_token_ids)
+        if detach:
+            feats = feats.detach()
+        return self.conf_head(feats)
+
     def bias(self, h, g, prev_token_ids):
         return self.w2(self.compute_latent(h, g, prev_token_ids))  # (BN, block, V)
 
@@ -337,20 +381,56 @@ class HybridRefinerHead(nn.Module):
         self.base_up.weight.copy_(up.to(self.base_up.weight))          # (V, r)
 
 
+def _markov_loss_from_target_probs(draft_logits, target_probs, target_tokens, loss_weight,
+                                   l1_alpha: float = 0.9, ce_alpha: float = 0.1):
+    """markov_style_loss with the TARGET softmax already computed. Split out so the K consistency
+    passes share ONE softmax over the (152k) vocab instead of recomputing it per pass -- at
+    BN*block = 6400 rows that softmax is a ~3.9GB fp32 tensor, so this is not a micro-opt.
+
+    draft_logits (N,V); target_probs (N,V) fp32 softmax of the target logits; target_tokens (N,)."""
+    denom = loss_weight.sum().clamp(min=1.0)
+    ce = (F.cross_entropy(draft_logits, target_tokens, reduction="none") * loss_weight).sum() / denom
+    dp = draft_logits.float().softmax(dim=-1)
+    l1 = ((dp - target_probs).abs().sum(dim=-1) * loss_weight).sum() / denom  # sum|dp-tp| = 2*TV
+    loss = ce_alpha * ce + l1_alpha * l1
+    return loss, ce.detach(), l1.detach()
+
+
+def markov_loss_shared_target(draft_logits, target_probs, target_tokens, loss_weight,
+                              l1_alpha: float = 0.9, ce_alpha: float = 0.1,
+                              grad_checkpoint: bool = False):
+    """_markov_loss_from_target_probs, optionally RECOMPUTED in backward instead of stored.
+
+    Why this exists: the loss keeps two fp32 (N,V) tensors alive for backward -- `dp` (softmax
+    backward needs its output) and `dp - target_probs` (abs backward needs the sign). At
+    N = BN*block = 6400 and V = 151936 that is 3.62 GiB each, 7.24 GiB per call, and their only
+    product is a SCALAR. Every one of them is recoverable from `draft_logits` (bf16, 1.81 GiB,
+    which has to be kept regardless), so checkpointing trades one extra softmax for ~7.24 GiB.
+    With K consistency rounds that is the difference between ~50 GiB and ~18 GiB (K=3 OOMs at
+    79 GiB otherwise), and it drops the marginal cost of a round from 9.06 to 1.81 GiB.
+
+    Only pure tensor ops are wrapped here -- no nn.Module, nothing FSDP-managed -- so unlike
+    checkpointing the head's forward this cannot perturb FSDP's all-gather/reduce-scatter.
+    Recompute is exact, so the result is bit-identical to the non-checkpointed path."""
+    if not (grad_checkpoint and torch.is_grad_enabled() and draft_logits.requires_grad):
+        return _markov_loss_from_target_probs(draft_logits, target_probs, target_tokens,
+                                              loss_weight, l1_alpha, ce_alpha)
+    return checkpoint(_markov_loss_from_target_probs, draft_logits, target_probs, target_tokens,
+                      loss_weight, l1_alpha, ce_alpha, use_reentrant=False)
+
+
 def markov_style_loss(draft_logits, target_logits, target_tokens, loss_weight,
-                      l1_alpha: float = 0.9, ce_alpha: float = 0.1):
+                      l1_alpha: float = 0.9, ce_alpha: float = 0.1,
+                      grad_checkpoint: bool = False):
     """DSpark-style loss (loss.py): l1_alpha * L1(softmax(draft) - softmax(target)) [= TV distance,
     which is 1 - accept_rate] + ce_alpha * CE(draft, target_token). Use for BOTH heads.
 
     draft_logits, target_logits: (N, V).  target_tokens: (N,) long.  loss_weight: (N,) float 0/1.
-    Returns (loss, ce_detached, l1_detached)."""
-    denom = loss_weight.sum().clamp(min=1.0)
-    ce = (F.cross_entropy(draft_logits, target_tokens, reduction="none") * loss_weight).sum() / denom
-    dp = draft_logits.float().softmax(dim=-1)
-    tp = target_logits.float().softmax(dim=-1)
-    l1 = ((dp - tp).abs().sum(dim=-1) * loss_weight).sum() / denom  # sum|dp-tp| = 2*TV
-    loss = ce_alpha * ce + l1_alpha * l1
-    return loss, ce.detach(), l1.detach()
+    Returns (loss, ce_detached, l1_detached). Prefer markov_loss_shared_target when a caller
+    already holds the target softmax -- this recomputes it (another 3.62 GiB at N=6400)."""
+    return markov_loss_shared_target(
+        draft_logits, target_logits.float().softmax(dim=-1), target_tokens, loss_weight,
+        l1_alpha, ce_alpha, grad_checkpoint)
 
 
 def build_loss_weight_mask(eval_mask, loss_decay_gamma=4.0):
@@ -368,12 +448,31 @@ def build_loss_weight_mask(eval_mask, loss_decay_gamma=4.0):
 
 def combined_training_loss(head, base_logits, h, g, gt_prev_ids, target_logits, target_tokens,
                            loss_weight, consistency_weight: float = 0.0,
-                           l1_alpha: float = 0.9, ce_alpha: float = 0.1, loss_decay_gamma: float = 4.0):
-    """Teacher-forced markov_style_loss  +  optional CONSISTENCY term (our Jacobi self-consistency):
-    a second pass conditioned on the DRAFTER's OWN argmax prev (what the first Jacobi pass sees at
-    inference), so the refiner is trained robust to imperfect self-predicted prev.
+                           consistency_passes: int = 1, grad_checkpoint_loss: bool = False,
+                           l1_alpha: float = 0.9, ce_alpha: float = 0.1, loss_decay_gamma: float = 4.0,
+                           pin_slot0: bool = True):
+    """Teacher-forced markov_style_loss  +  optional CONSISTENCY term over the first
+    `consistency_passes` rounds of free-running Jacobi decoding.
 
-      total = loss_tf  +  consistency_weight * loss_seed
+      total = loss_tf  +  consistency_weight * mean_j( loss_cons[j] )     j = 0 .. K-1
+
+    Each round re-feeds the refiner its OWN argmax from the previous round, i.e. exactly the prev it
+    would see at pass j of inference (`accept_lengths` runs the identical recurrence), so the refiner
+    is trained robust to the imperfect self-predicted prev it actually encounters. Round 0 seeds from
+    the DRAFTER's parallel argmax and is slot-for-slot identical to the old single-pass term, so
+    consistency_passes=1 reproduces the previous behaviour exactly.
+
+    NOTE the target of every round is the GROUND TRUTH (target_logits/target_tokens), same as
+    loss_tf. This is unrolled scheduled sampling, NOT CLLM fixed-point consistency -- CLLM
+    distills each Jacobi step toward the trajectory's own converged fixed point instead.
+
+    The K losses are AVERAGED, not summed, so consistency_weight keeps the same meaning as K varies
+    (K=1 is then numerically identical to the old code) and K can be swept without re-tuning it.
+
+    `argmax` between rounds cuts the autograd graph, so the K rounds are K INDEPENDENT subgraphs --
+    no BPTT through the recurrence. Activation memory is therefore O(K): each round holds its own
+    (BN,block,V) logits plus the fp32 softmax inside the loss. At BN=400/block=16/V=152k that is
+    several GB per round, so raising K raises peak memory roughly linearly.
 
     loss_decay_gamma=4.0 reproduces DSpark's per-position loss decay (exp(-pos/gamma)); set None to
     disable. consistency_weight=0 -> pure teacher-forced (unify to DSpark). Shapes: base_logits/
@@ -381,26 +480,46 @@ def combined_training_loss(head, base_logits, h, g, gt_prev_ids, target_logits, 
     (BN,block) = eval_mask."""
     V = target_logits.shape[-1]           # base_logits is None in shared mode; target_logits has the same V
     w = build_loss_weight_mask(loss_weight, loss_decay_gamma).reshape(-1)  # == DSpark decayed mask
-    tgt_l = target_logits.reshape(-1, V)
     tgt_t = target_tokens.reshape(-1).long()
+    # ONE softmax over the target, shared by loss_tf and all K consistency rounds.
+    tgt_p = target_logits.reshape(-1, V).float().softmax(dim=-1)
 
     base_tf, refined_tf = head(base_logits, h, g, gt_prev_ids)  # teacher-forced pass; base_tf = shared base or echo
-    loss_tf, ce_tf, l1_tf = markov_style_loss(refined_tf.reshape(-1, V), tgt_l, tgt_t, w,
-                                              l1_alpha, ce_alpha)
+    loss_tf, ce_tf, l1_tf = markov_loss_shared_target(refined_tf.reshape(-1, V), tgt_p, tgt_t, w,
+                                                      l1_alpha, ce_alpha, grad_checkpoint_loss)
     total = loss_tf
     loss_cons = refined_tf.new_zeros(())   # base_logits may be None (shared); refined_tf is always a tensor
-    if consistency_weight > 0.0:
-        # Seed prev = drafter's own argmax (== first Jacobi pass at inference), KEEPING the two known
-        # slots (token-before-block, anchor) from the teacher-forced prev. Matches dflash_refiner_cotrain.
-        block = base_tf.shape[1]                                 # base_tf = shared base or echoed lm_head(h)
-        base_pred = base_tf.detach().argmax(dim=-1)              # (BN, block) drafter argmax
-        seed_prev = gt_prev_ids.clone()
-        if block > 2:
-            seed_prev[:, 2:] = base_pred[:, 1:block - 1]         # slots 0,1 stay correct
-        _, refined_seed = head(base_logits, h, g, seed_prev)
-        loss_cons, _, _ = markov_style_loss(refined_seed.reshape(-1, V), tgt_l, tgt_t, w,
-                                            l1_alpha, ce_alpha)
+    per_pass = []
+    K = int(consistency_passes)
+    if consistency_weight > 0.0 and K > 0:
+        # Free-running Jacobi rollout, IDENTICAL recurrence to accept_lengths(): seed from the
+        # drafter's parallel argmax and take prev = pred rolled by one with slot 0 = the
+        # caller-provided first prev (known at inference in both conventions).
+        # pin_slot0 (fillin): slot 0 carries the GIVEN anchor -- pin it so the rollout matches
+        # inference. shift (pin_slot0=False): target_tokens[:, 0] is a REAL prediction target
+        # (token anchor+1); pinning would leak the teacher into the free-running rollout.
+        prev_slot0 = gt_prev_ids[:, 0]                           # first prev (convention-correct)
+        pred = base_tf.detach().argmax(dim=-1)                   # (BN, block) drafter parallel argmax
+        if pin_slot0:
+            pred[:, 0] = target_tokens[:, 0]                     # slot 0 = anchor (given, not predicted)
+        for _ in range(K):
+            prev = pred.roll(shifts=1, dims=1)
+            prev[:, 0] = prev_slot0
+            _, refined_j = head(base_logits, h, g, prev)
+            loss_j, _, _ = markov_loss_shared_target(refined_j.reshape(-1, V), tgt_p, tgt_t, w,
+                                                     l1_alpha, ce_alpha, grad_checkpoint_loss)
+            per_pass.append(loss_j)
+            # detach -> next round's graph is independent of this one (no BPTT).
+            pred = refined_j.detach().argmax(dim=-1)
+            if pin_slot0:
+                pred[:, 0] = target_tokens[:, 0]
+        loss_cons = torch.stack(per_pass).mean()
         total = loss_tf + consistency_weight * loss_cons
     return total, {"tf": loss_tf.detach(), "ce": ce_tf, "l1": l1_tf, "cons": loss_cons.detach(),
+                   # per-round consistency losses, for logging which Jacobi round is still bad
+                   "cons_per_pass": [l.detach() for l in per_pass],
                    "refined": refined_tf,   # reused for the accuracy metric (no recompute)
-                   "base": base_tf}         # shared: head-computed base (=w2(ro_down(h))); else: echoed lm_head(h)
+                   "base": base_tf,         # shared: head-computed base (=w2(ro_down(h))); else: echoed lm_head(h)
+                   # Target softmax, so the lambda_base term reuses it instead of softmaxing the
+                   # SAME target_logits again (another 3.62 GiB fp32 at N=6400).
+                   "target_probs": tgt_p}

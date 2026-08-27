@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import warnings
+from datetime import timedelta
 from typing import Optional, Tuple
 
 import torch
@@ -47,7 +48,7 @@ from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import get_dflash_target_model
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 from specforge.optimizer import BF16Optimizer
-from specforge.tracker import create_tracker
+from specforge.tracker import create_tracker, get_tracker_class
 from specforge.utils import get_last_checkpoint, print_on_rank0, print_with_rank
 
 # rank-0 log file handle (opened in main once output_dir is known). log_print writes to BOTH stdout
@@ -105,6 +106,33 @@ def parse_args():
                                help="r: Markov W1/W2 rank AND SGU bottleneck width (DSpark uses 256).")
     refiner_group.add_argument("--markov-only", action="store_true",
                                help="Train the pure Markov head (DSpark VanillaMarkov special case; SGU off).")
+    refiner_group.add_argument("--anchor-full-weight", action="store_true",
+                               help="Apply the lambda_base drafter-anchor with UNDECAYED weights (validity only), "
+                               "anchoring deep slots at full strength. The head's learning loss keeps its decay. "
+                               "Fixes the depth-graded standalone-drafter erosion measured on the b7shift arms "
+                               "(accept@6 0.52->0.20 by 40k steps under the decayed anchor, whose slot-6 weight is 0.22).")
+    refiner_group.add_argument("--confidence-alpha", type=float, default=0.0,
+                               help="Weight of the confidence head's BCE loss (0 = OFF: no module, no loss, "
+                               "bit-identical to pre-confidence runs). JOINTLY TRAINED like official DSpark "
+                               "(alpha=1.0 there): the BCE gradients flow through the conf input features "
+                               "into the head/drafter backbone (auxiliary 'will this be accepted?' task).")
+    refiner_group.add_argument("--confidence-mode", choices=("trajectory", "dspark"), default="trajectory",
+                               help="Conf input. trajectory (ours): the refiner's causal-mixed latent -- slot k "
+                               "sees ALL previous block tokens (DSpark's 1-token input is measurably "
+                               "overconfident at depth: official 14B ECE 0.019@0 -> 0.101@6). dspark "
+                               "(official): cat([h, W1[prev]]) into Linear(H+r,1), for faithful repro arms.")
+    refiner_group.add_argument("--confidence-detach", action="store_true",
+                               help="Cut the conf gradients at its input features: train ONLY the conf module "
+                               "(inference-only calibration; the main objective is untouched). Default OFF = "
+                               "joint training.")
+    refiner_group.add_argument("--block-convention", choices=("fillin", "shift"), default="fillin",
+                               help="Block label alignment. fillin (default, z-lab style): slot k predicts "
+                               "the token AT anchor+k; anchor slot excluded -> block_size-1 drafts. Matches "
+                               "z-lab DFlash warm starts (b16 arms). shift (deepseek/DeepSpec style): slot k "
+                               "predicts the token AFTER its position; every slot supervised -> block_size "
+                               "drafts. REQUIRED when warm-starting from deepseek-ai/dflash_*_block7: those "
+                               "are shift-native, and retrofitting them to fillin permanently costs deep-"
+                               "position accept (measured: standalone drafter capped at ~3.9 vs native 5.43).")
     refiner_group.add_argument("--no-hidden", action="store_true",
                                help="Token-only SGU input (drop h/g; use prev-token W1 only).")
     refiner_group.add_argument("--no-perpos", action="store_true",
@@ -192,9 +220,31 @@ def parse_args():
     )
     refiner_group.add_argument(
         "--consistency-weight", type=float, default=0.0,
-        help="2-point consistency loss weight (CLLM-style). >0 adds CE on the refiner conditioned on "
-        "the drafter's SEED prev (the first Jacobi pass's real input) so it learns to converge in "
-        "fewer passes. Costs ~one extra refiner+lm_head per step. 0 = off. Try ~0.5.",
+        help="Consistency loss weight. >0 supervises the refiner on the prev it actually sees during "
+        "free-running Jacobi decoding (not the ground-truth prev), so it learns to converge in fewer "
+        "passes. See --consistency-passes for how many rounds. 0 = off. Try ~0.5. NOTE the target of "
+        "every round is the GROUND TRUTH, i.e. unrolled scheduled sampling -- NOT CLLM fixed-point "
+        "consistency, which would distill each round toward the trajectory's own converged output.",
+    )
+    refiner_group.add_argument(
+        "--no-loss-grad-checkpoint", action="store_false", dest="loss_grad_checkpoint",
+        help="Disable activation checkpointing of the loss terms (ON by default). Each loss call "
+        "otherwise keeps two fp32 (N,V) tensors for backward -- 3.62 GiB each at N=BN*block=6400, "
+        "V=152k -- whose only product is a scalar and which are all recomputable from the bf16 "
+        "logits. Checkpointing them cuts ~7.24 GiB per call: with --consistency-passes 3 that is "
+        "~50 GiB -> ~18 GiB (50 GiB OOMs on an 80 GiB card), and it drops the marginal cost of a "
+        "Jacobi round from 9.06 to 1.81 GiB. Recompute is exact, so results are bit-identical; the "
+        "cost is one extra softmax per loss call in backward. Turn off only to measure that cost.",
+    )
+    refiner_group.add_argument(
+        "--consistency-passes", type=int, default=3,
+        help="How many free-running Jacobi rounds the consistency term covers (K). Round 0 seeds from "
+        "the drafter's parallel argmax; each later round re-feeds the refiner its own argmax, matching "
+        "pass K of inference (which itself defaults to block_size-1 passes). The K per-round losses are "
+        "AVERAGED, so --consistency-weight keeps its meaning as K changes and K=1 is numerically "
+        "identical to the old single-pass term. Costs one extra refiner forward/backward per round and "
+        "peak activation memory grows ~linearly in K (each round holds its own (BN,block,V) logits plus "
+        "an fp32 softmax) -- if you OOM, lower K first.",
     )
     refiner_group.add_argument(
         "--use-residual-gate",
@@ -298,7 +348,7 @@ def parse_args():
     output_group.add_argument("--cache-dir", type=str, default="./cache")
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--save-interval", type=int, default=1000)
-    output_group.add_argument("--keep-last-n-checkpoints", type=int, default=2,
+    output_group.add_argument("--keep-last-n-checkpoints", type=int, default=4,
                               help="After saving, delete older epoch_*_step_* dirs, keeping only the "
                               "last N (each ckpt ~16GB: drafter+head+8 optim shards). 0 = keep all "
                               "(WILL fill /gpfs). Latest is always kept so --resume works.")
@@ -313,21 +363,56 @@ def parse_args():
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Fail fast HERE, before init_distributed() and before any model is loaded.
+    # The tracker is otherwise only constructed at create_tracker() much further down,
+    # so a missing W&B key surfaced only AFTER NCCL was up: rank 0 raised, the other 15
+    # ranks then blocked 30 min in store->get() waiting for its ncclUniqueId, and all 16
+    # ended up in the sleep-forever handler -> ~2h of 16 GPUs burned on a config typo
+    # (job 677663). validate_args() also recovers the key from ~/.netrc, i.e. from a
+    # previous `wandb login`, and prints which of the 3 ways to supply it are available.
+    tracker_class = get_tracker_class(args.report_to)
+    if tracker_class is not None:
+        tracker_class.validate_args(parser, args)
+
+    return args
 
 
-def build_dataloader(args, tokenizer, block_size) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """Build the train (+ optional eval) dataloader."""
-    import hashlib
+# CPU-only group used ONLY to serialize dataset-cache construction (see _data_barrier).
+_DATA_PREP_PG = None
 
-    cache_params_string = (
-        f"{args.train_data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}"
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    train_eagle3_dataset = build_eagle3_dataset(
-        dataset=train_dataset,
+def _data_barrier(tag):
+    """Barrier for the rank-0-first dataset build. Deliberately NOT the default group.
+
+    The default group is NCCL: a barrier there busy-waits on the GPU and is bounded by
+    --dist-timeout (minutes), while rank 0 may spend hours tokenizing the corpus. So we
+    use a dedicated gloo group with a long timeout instead.
+    """
+    global _DATA_PREP_PG
+    if not dist.is_initialized():
+        return
+    if _DATA_PREP_PG is None:
+        # Collective: every rank must reach this, which they do (build_dataloader is
+        # called unconditionally by all ranks at the same point in main()).
+        _DATA_PREP_PG = dist.new_group(backend="gloo", timeout=timedelta(hours=12))
+    # NOT print_with_rank: that routes to logger.info, whose output never reaches the
+    # job logs (not even init_distributed's "bind to device"). This barrier can hold for
+    # tens of minutes while rank 0 tokenizes, so it MUST be visible or the run looks hung.
+    rank = dist.get_rank()
+    print(f"[data][rank{rank}] waiting at barrier: {tag}", flush=True)
+    t0 = time.time()
+    dist.barrier(group=_DATA_PREP_PG)
+    print(f"[data][rank{rank}] released after {time.time() - t0:.1f}s: {tag}", flush=True)
+
+
+def _build_split(args, tokenizer, block_size, data_path, cache_key):
+    """load_dataset + tokenize + filter for one split. All three steps write to SHARED
+    on-disk caches, so this must only ever run under the rank-0-first guard below."""
+    dataset = load_dataset("json", data_files=data_path)["train"]
+    eagle3 = build_eagle3_dataset(
+        dataset=dataset,
         tokenizer=tokenizer,
         chat_template=args.chat_template,
         max_length=args.max_length,
@@ -336,18 +421,58 @@ def build_dataloader(args, tokenizer, block_size) -> Tuple[DataLoader, Optional[
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
     )
-
     min_loss_tokens = 2 * block_size
-    original_size = len(train_eagle3_dataset)
-    train_eagle3_dataset = train_eagle3_dataset.filter(
-        lambda x: x["loss_mask"].sum() >= min_loss_tokens
-    )
-    print_on_rank0(
-        f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
-    )
+    original_size = len(eagle3)
+    eagle3 = eagle3.filter(lambda x: x["loss_mask"].sum() >= min_loss_tokens)
+    # log_print, not print_on_rank0 -- the latter goes to logger.info, which is dropped.
+    log_print(f"[data] filtered {data_path}: {original_size} -> {len(eagle3)} samples")
+    return eagle3
+
+
+def build_dataloader(args, tokenizer, block_size) -> Tuple[DataLoader, Optional[DataLoader]]:
+    """Build the train (+ optional eval) dataloader.
+
+    RANK-0-FIRST. Every step below (the `load_dataset` arrow cache, the
+    build_eagle3_dataset `.pkl`, and the `.filter()` cache) writes to a path derived
+    only from its inputs -- so it is IDENTICAL across ranks. If all ranks run it
+    concurrently they write the same files at the same time. HF's FileLock serializes
+    ranks within a node but NOT across nodes (advisory flock on GPFS is node-local), so
+    on a multi-node run one node's writer renames the `.incomplete` staging dir out from
+    under the other's and that rank dies with FileNotFoundError / "I/O operation on
+    closed file". Global rank 0 builds; everyone else waits and then hits pure cache.
+    Must be *global* rank 0, not local rank -- one-writer-per-node is exactly the
+    configuration that breaks.
+    """
+    import hashlib
+
+    def _key(data_path):
+        s = f"{data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}"
+        return hashlib.md5(s.encode()).hexdigest()
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    splits = {}
+
+    if rank == 0:
+        splits["train"] = _build_split(
+            args, tokenizer, block_size, args.train_data_path, _key(args.train_data_path)
+        )
+        if args.eval_data_path:
+            splits["eval"] = _build_split(
+                args, tokenizer, block_size, args.eval_data_path, _key(args.eval_data_path)
+            )
+    _data_barrier("dataset cache built by rank 0")
+    if rank != 0:
+        # Same paths, now fully populated -> these are cache hits, no writes.
+        splits["train"] = _build_split(
+            args, tokenizer, block_size, args.train_data_path, _key(args.train_data_path)
+        )
+        if args.eval_data_path:
+            splits["eval"] = _build_split(
+                args, tokenizer, block_size, args.eval_data_path, _key(args.eval_data_path)
+            )
 
     train_dataloader = prepare_dp_dataloaders(
-        train_eagle3_dataset,
+        splits["train"],
         args.batch_size,
         num_workers=args.dataloader_num_workers,
         shuffle=True,
@@ -356,17 +481,8 @@ def build_dataloader(args, tokenizer, block_size) -> Tuple[DataLoader, Optional[
 
     eval_dataloader = None
     if args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
-        eval_eagle3 = build_eagle3_dataset(
-            dataset=eval_dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            is_preformatted=args.is_preformatted,
-        )
-        eval_eagle3 = eval_eagle3.filter(lambda x: x["loss_mask"].sum() >= min_loss_tokens)
         eval_dataloader = prepare_dp_dataloaders(
-            eval_eagle3,
+            splits["eval"],
             args.batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
@@ -450,12 +566,39 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer, base
     dist.barrier()
 
 
-def record_metrics(args, loss, accuracy, global_step, tracker, optimizer, train_dataloader):
+def record_metrics(args, loss, accuracy, global_step, tracker, optimizer, train_dataloader,
+                   loss_terms=None, cons_per_pass=None):
+    """loss_terms: {'tf','ce','l1','cons'} rank-averaged scalars. cons_per_pass: per-Jacobi-round
+    consistency losses (len == --consistency-passes), also rank-averaged, or None when consistency
+    is off."""
     logdict = {"train/lr": optimizer.get_learning_rate(), "train/loss": loss, "train/accuracy": accuracy}
+    # Topology-independent x-axes for cross-run overlays (official-code runs log the same
+    # keys): optim_step = parameter updates, samples = sequences consumed. Select either
+    # as the x-axis in the wandb UI to compare arms with different world sizes/accum.
+    logdict["progress/optim_step"] = global_step // max(1, args.accumulation_steps)
+    logdict["progress/samples"] = global_step * args.batch_size * dist.get_world_size()
+    extra = ""
+    if loss_terms:
+        logdict.update({f"train/{k}": v for k, v in loss_terms.items()})
+        extra += f", tf: {loss_terms['tf']:.4f}, ce: {loss_terms['ce']:.4f}, l1: {loss_terms['l1']:.4f}"
+        if args.consistency_weight > 0:
+            extra += f", cons: {loss_terms['cons']:.4f}"
+        if "conf" in loss_terms:
+            extra += f", conf: {loss_terms['conf']:.4f}"
+    if cons_per_pass:
+        for j, v in enumerate(cons_per_pass):
+            logdict[f"train/cons_pass{j}"] = v
+        # Spread across rounds is the honest "is K>1 doing anything?" signal: ~0 means the Jacobi
+        # rollout hit a fixed point at round 0, so every extra round is a duplicate of round 0.
+        spread = max(cons_per_pass) - min(cons_per_pass)
+        logdict["train/cons_spread"] = spread
+        extra += "  cons/round=[" + " ".join(f"{v:.4f}" for v in cons_per_pass) + f"] spread={spread:.2e}"
+        if len(cons_per_pass) > 1 and spread < 1e-6:
+            extra += "  <- FLAT: rollout at fixed point, K>1 adding nothing"
     log_print(
         f"Train - Step {global_step} "
         f"[{global_step}/{args.num_epochs * len(train_dataloader) // args.accumulation_steps}?], "
-        f"Loss: {loss:.4f}, Acc: {accuracy:.4f}"
+        f"Loss: {loss:.4f}, Acc: {accuracy:.4f}{extra}"
     )
     tracker.log(logdict, step=global_step)
 
@@ -550,7 +693,8 @@ def main():
         )
     draft_model.config._attn_implementation = args.attention_backend
     block_size = draft_model.block_size
-    mask_token_id = (draft_model.config.dflash_config or {}).get("mask_token_id", None)
+    # mask_token_id = (draft_model.config.dflash_config or {}).get("mask_token_id", None)
+    mask_token_id = (getattr(draft_model.config, "dflash_config", None) or {}).get("mask_token_id", None) or getattr(draft_model.config, "mask_token_id", None)
     if mask_token_id is None:
         mask_token_id = draft_model.mask_token_id
     print_on_rank0(
@@ -627,7 +771,14 @@ def main():
         ce_alpha=args.ce_alpha,
         loss_decay_gamma=args.loss_decay_gamma,
         consistency_weight=args.consistency_weight,
+        consistency_passes=args.consistency_passes,
+        grad_checkpoint_loss=args.loss_grad_checkpoint,
         cotrain_drafter=not args.no_cotrain_drafter,
+        block_convention=args.block_convention,
+        anchor_full_weight=args.anchor_full_weight,
+        confidence_alpha=args.confidence_alpha,
+        confidence_mode=args.confidence_mode,
+        confidence_detach=args.confidence_detach,
     ).cuda()
     refiner_model.refiner = refiner_model.refiner.to(torch.bfloat16)
     if int(os.environ.get("RANK", "0")) == 0:
@@ -640,7 +791,8 @@ def main():
             f"use_mixer={not args.no_mixer}  use_mlp={not args.no_mlp}  "
             f"use_residual={not args.no_residual}  mlp_ratio={args.mlp_ratio}\n"
             f"  loss: ce_alpha={args.ce_alpha} l1_alpha={args.l1_alpha} decay_gamma={args.loss_decay_gamma} "
-            f"consistency_weight={args.consistency_weight}   (DSpark: ce0.1/l1_0.9/gamma4)\n"
+            f"consistency_weight={args.consistency_weight} x{args.consistency_passes} Jacobi rounds (mean)"
+            f"  loss_ckpt={args.loss_grad_checkpoint}   (DSpark: ce0.1/l1_0.9/gamma4)\n"
             f"  lambda_base  = {args.lambda_base_start}->{args.lambda_base_floor} (ratio {args.lambda_base_decay_ratio})   "
             f"drafter_lr_scale = {args.drafter_lr_scale}  cotrain_drafter={not args.no_cotrain_drafter}\n"
             f"  head params  = {sum(p.numel() for p in refiner_model.refiner.parameters()):,} | "
@@ -919,12 +1071,44 @@ def main():
                 optimizer.step()
 
             if global_step % args.log_interval == 0:
+                ws = dist.get_world_size()
                 loss_log, acc_log = loss.clone(), accuracy.clone()
                 dist.all_reduce(loss_log)
+                # FAIL FAST on non-finite loss. The verify block promises "first-batch loss must
+                # be finite" but nothing ever enforced it: the markov-b7 run trained 900 steps of
+                # pure NaN before a human noticed. loss_log is the SAME all-reduced value on every
+                # rank, so either all ranks raise together (clean torchrun teardown, no straggler
+                # hang) or none do. NaN poisons fp32 optimizer state -- aborting is always right.
+                if not torch.isfinite(loss_log):
+                    raise RuntimeError(
+                        f"NON-FINITE all-reduced loss ({loss_log.item()}) at step {global_step}. "
+                        "Weights/optimizer state are already poisoned -- do NOT --resume from a "
+                        "checkpoint saved after this point. If the model/config is unchanged from "
+                        "a run that trained cleanly, suspect a faulty GPU on one of these hosts "
+                        "and resubmit (or exclude them with bsub -R)."
+                    )
                 dist.all_reduce(acc_log)
-                loss_log /= dist.get_world_size()
-                acc_log /= dist.get_world_size()
-                record_metrics(args, loss_log.item(), acc_log.item(), global_step, tracker, optimizer, train_dataloader)
+                loss_log /= ws
+                acc_log /= ws
+                # Loss breakdown + per-Jacobi-round consistency, rank-averaged the same way.
+                # Every rank runs the SAME number of all_reduce calls here: last_loss_terms always has
+                # the same 4 keys and last_cons_per_pass is None/len-K identically on all ranks (both
+                # derive from args), so this cannot desync the collective.
+                terms_log = {}
+                # "conf" exists iff --confidence-alpha > 0 (same args on every rank -> the
+                # all_reduce count below stays identical across ranks; no desync possible).
+                _term_keys = ("tf", "ce", "l1", "cons") + (("conf",) if args.confidence_alpha > 0 else ())
+                for k in _term_keys:
+                    t = refiner_model.last_loss_terms[k].detach().clone().float()
+                    dist.all_reduce(t)
+                    terms_log[k] = (t / ws).item()
+                cpp_log = None
+                if refiner_model.last_cons_per_pass is not None:
+                    t = refiner_model.last_cons_per_pass.detach().clone().float()
+                    dist.all_reduce(t)
+                    cpp_log = (t / ws).tolist()
+                record_metrics(args, loss_log.item(), acc_log.item(), global_step, tracker, optimizer,
+                               train_dataloader, loss_terms=terms_log, cons_per_pass=cpp_log)
                 tracker.log({"train/lambda_base": lambda_base}, step=global_step)
 
             if eval_dataloader is not None and global_step % args.eval_interval == 0:

@@ -1,0 +1,111 @@
+serviceAccountName: "gdr"
+namespace: platform
+jobName: zwang-hybrid-s2-b16dspark-sgu
+priority: high-priority
+
+containerImage: us.icr.io/cil15-shared-registry/platform/goon-torch-dev:latest
+restartPolicy: Never
+
+numPods: 4
+numCpusPerPod: 72
+numGpusPerPod: 8
+totalMemoryPerPod: 1000Gi
+
+environmentVariables:
+  - name: HF_HOME
+    value: /gpfs/zwang33/hf_cache
+  - name: TORCHINDUCTOR_CACHE_DIR
+    value: /gpfs/zwang33/cache/compiled_kernels
+  - name: SPECFORGE_DATA_NUM_PROC
+    value: "32"
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: NCCL_IB_HCA
+    value: mlx5_0,mlx5_3
+  - name: NCCL_IB_QPS_PER_CONNECTION
+    value: "8"
+  - name: NCCL_IB_SPLIT_DATA_ON_QPS
+    value: "0"
+  - name: NCCL_IB_PCI_RELAXED_ORDERING
+    value: "1"
+  - name: NCCL_IB_GID_INDEX
+    value: "3"
+  - name: NCCL_SOCKET_IFNAME
+    value: eth0
+  - name: NCCL_ALGO
+    value: Ring
+  - name: NCCL_IGNORE_CPU_AFFINITY
+    value: "1"
+  - name: NCCL_DEBUG_SUBSYS
+    value: INIT,GRAPH,ENV,TUNING
+  - name: NCCL_IB_DISABLE
+    value: "0"
+  - name: NCCL_SOCKET_NTHREADS
+    value: "2"
+  - name: NCCL_CROSS_NIC
+    value: "0"
+  - name: NCCL_DEBUG
+    value: WARN
+  - name: OMP_NUM_THREADS
+    value: "16"
+  - name: NCCL_BUFFSIZE
+    value: "8388608"
+  - name: CUDA_VISIBLE_DEVICES
+    value: 0,1,2,3,4,5,6,7
+
+setupCommands:
+  - test -n "$WANDB_API_KEY" || { echo "FATAL: export WANDB_API_KEY before submitting" >&2; exit 1; }
+  - pip install sglang==0.5.9 openai accelerate
+  - rm -rf SpecForge-dLLM-training
+  - git clone https://github.com/ZKBig/SpecForge-dLLM-training.git
+  - cd SpecForge-dLLM-training
+  - pip install -e .
+
+# Hybrid refiner run: s2-b16dspark-sgu -- [s2_b16dspark] SGU three-source (h,g,prev) - headline
+mainProgram: >
+  scripts/train_hybrid_refiner_IBM.py
+  --l1-alpha 0.9
+  --ce-alpha 0.1
+  --loss-decay-gamma 4.0
+  --markov-rank 256
+  --learning-rate 0.0006
+  --num-anchors 256
+  --max-length 4096
+  --batch-size 2
+  --accumulation-steps 1
+  --num-epochs 10
+  --eval-interval 1000
+  --target-model-path /gpfs/zwang33/models/Qwen3-8B
+  --train-data-path /gpfs/zwang33/dflash_data/refiner_train_nothink.jsonl
+  --eval-data-path /gpfs/zwang33/dflash_data/refiner_eval_nothink.jsonl
+  --cache-dir /gpfs/zwang33/cache
+  --chat-template qwen
+  --attention-backend sdpa
+  --warmup-ratio 0.04
+  --max-grad-norm 1.0
+  --tp-size 1
+  --log-interval 50
+  --save-interval 5000
+  --dflash-model-path z-lab/Qwen3-8B-DFlash-b16
+  --random-init-drafter
+  --lambda-base-start 0.0
+  --lambda-base-floor 0.0
+  --output-dir /gpfs/zwang33/hybrid_out/s2-b16dspark-sgu
+  --report-to wandb
+  --wandb-project ripple-dspark
+  --wandb-name hybrid-s2-b16dspark-sgu
+  --resume
+
+imagePullSecrets:
+  - name: all-icr-io
+
+volumes:
+  - name: datasets
+    claimName: platform-dataset-1
+    mountPath: /datasets
+  - name: checkpoints
+    claimName: platform-checkpoints
+    mountPath: /gpfs
+
+warmupGracePeriodDuration: 20m
+deletionOnFailureGracePeriodDuration: 10m
